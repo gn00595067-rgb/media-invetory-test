@@ -206,9 +206,78 @@ def init_db():
             PRIMARY KEY (media_platform, year, month)
         )
     ''')
-    
+    # 媒體採購：各媒體每年每月「購買秒數」與「購買價格」（供 ROI 換算成本、並可同步每日可用秒數）
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS platform_monthly_purchase (
+            media_platform TEXT NOT NULL,
+            year INTEGER NOT NULL,
+            month INTEGER NOT NULL,
+            purchased_seconds INTEGER NOT NULL,
+            purchase_price REAL NOT NULL,
+            PRIMARY KEY (media_platform, year, month)
+        )
+    ''')
     conn.commit()
     conn.close()
+
+def get_platform_monthly_purchase(media_platform, year, month):
+    """取得某媒體某年某月的購買秒數與購買價格，回傳 (purchased_seconds, purchase_price) 或 None"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        'SELECT purchased_seconds, purchase_price FROM platform_monthly_purchase WHERE media_platform=? AND year=? AND month=?',
+        (media_platform, int(year), int(month))
+    )
+    row = c.fetchone()
+    conn.close()
+    return row if row is not None else None
+
+def set_platform_monthly_purchase(media_platform, year, month, purchased_seconds, purchase_price):
+    """設定某媒體某年某月的購買秒數與購買價格；並同步更新 platform_monthly_capacity（每日可用 = 購買秒數/當月天數）"""
+    import calendar
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('''
+        INSERT OR REPLACE INTO platform_monthly_purchase (media_platform, year, month, purchased_seconds, purchase_price)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (media_platform, int(year), int(month), int(purchased_seconds), float(purchase_price)))
+    ndays = calendar.monthrange(int(year), int(month))[1]
+    daily_seconds = int(purchased_seconds) // ndays if ndays else 0
+    c.execute('''
+        INSERT OR REPLACE INTO platform_monthly_capacity (media_platform, year, month, daily_available_seconds)
+        VALUES (?, ?, ?, ?)
+    ''', (media_platform, int(year), int(month), daily_seconds))
+    conn.commit()
+    conn.close()
+
+def load_platform_monthly_purchase_for_year(media_platform, year):
+    """載入某媒體某年 1~12 月的購買資料，回傳 dict: month -> (purchased_seconds, purchase_price)"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        'SELECT month, purchased_seconds, purchase_price FROM platform_monthly_purchase WHERE media_platform=? AND year=?',
+        (media_platform, int(year))
+    )
+    out = {row[0]: (row[1], row[2]) for row in c.fetchall()}
+    conn.close()
+    return out
+
+def load_platform_monthly_purchase_all_media_for_year(year):
+    """載入某年所有媒體 1~12 月購買資料，回傳 dict: media_platform -> { month -> (purchased_seconds, purchase_price) }"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute(
+        'SELECT media_platform, month, purchased_seconds, purchase_price FROM platform_monthly_purchase WHERE year=?',
+        (int(year),)
+    )
+    out = {}
+    for row in c.fetchall():
+        mp, mo, sec, pr = row[0], row[1], row[2], row[3]
+        if mp not in out:
+            out[mp] = {}
+        out[mp][mo] = (sec, pr)
+    conn.close()
+    return out
 
 def load_platform_settings():
     """從資料庫載入平台設定（優先使用資料庫中的設定）"""
@@ -2711,12 +2780,12 @@ if df_daily.empty and not df_orders.empty:
         df_daily = _explode_segments_to_daily_cached(df_seg_main) if not df_seg_main.empty else pd.DataFrame()
 
 # --- 分頁呈現（角色導向入口 + 只渲染當前分頁）---
-TAB_OPTIONS = ["📋 表1-資料", "📅 表2-秒數明細", "📊 表3-庫存熱力圖", "📈 總結表", "📉 總結表圖表", "🧪 實驗分頁", "📊 ROI 實驗"]
+TAB_OPTIONS = ["📋 表1-資料", "📅 表2-秒數明細", "📊 表3-庫存熱力圖", "📈 總結表", "📉 總結表圖表", "📋 媒體秒數與採購", "🧪 實驗分頁", "📊 ROI 實驗"]
 # 各角色可見分頁：行政主管=全部(預設)、業務=表1+表3(唯讀)、主管=表3+總結表+表1(含逐筆管理)
 TAB_OPTIONS_BY_ROLE = {
     "行政主管": TAB_OPTIONS,  # 擁有所有權限，預設角色
     "業務": ["📋 表1-資料", "📊 表3-庫存熱力圖"],
-    "主管": ["📊 表3-庫存熱力圖", "📈 總結表", "📉 總結表圖表", "📋 表1-資料", "🧪 實驗分頁", "📊 ROI 實驗"],
+    "主管": ["📊 表3-庫存熱力圖", "📈 總結表", "📉 總結表圖表", "📋 表1-資料", "📋 媒體秒數與採購", "🧪 實驗分頁", "📊 ROI 實驗"],
 }
 
 st.markdown("#### 你現在的身份是？")
@@ -3522,6 +3591,45 @@ elif selected_tab == "📉 總結表圖表":
     else:
         st.warning("📭 尚無每日資料，請先產生模擬資料。")
 
+elif selected_tab == "📋 媒體秒數與採購":
+    st.markdown("### 📋 媒體秒數與採購")
+    st.caption("輸入各媒體平台「一年 12 個月」的購買秒數與購買價格；儲存後會同步更新表3 的當月每日可用秒數，並供 ROI 實驗分頁換算成本。")
+    purchase_year = st.number_input("年度", min_value=2020, max_value=2030, value=datetime.now().year, key="purchase_year")
+    existing = load_platform_monthly_purchase_all_media_for_year(purchase_year)
+    import calendar
+    for mp in MEDIA_PLATFORM_OPTIONS:
+        st.markdown(f"#### {mp}")
+        data = existing.get(mp, {})
+        cols = st.columns(12)
+        inputs_sec = {}
+        inputs_price = {}
+        for m in range(1, 13):
+            with cols[m - 1]:
+                st.markdown(f"**{m}月**")
+                sec, pr = data.get(m, (0, 0.0))
+                inputs_sec[m] = st.number_input(
+                    "購買秒數",
+                    min_value=0,
+                    value=int(sec) if sec else 0,
+                    step=5000,
+                    key=f"purchase_sec_{mp}_{m}",
+                )
+                inputs_price[m] = st.number_input(
+                    "購買價格（元）",
+                    min_value=0.0,
+                    value=float(pr) if pr else 0.0,
+                    step=1000.0,
+                    format="%.0f",
+                    key=f"purchase_price_{mp}_{m}",
+                )
+        if st.button(f"儲存 {mp}", key=f"save_purchase_{mp}"):
+            for m in range(1, 13):
+                set_platform_monthly_purchase(mp, purchase_year, m, inputs_sec[m], inputs_price[m])
+            st.success(f"已儲存 {mp} {purchase_year} 年 1~12 月資料（並已同步表3 每日可用秒數）。")
+            st.rerun()
+    st.markdown("---")
+    st.caption("儲存後，ROI 實驗分頁將依「購買價格 ÷ 購買秒數」自動換算每秒成本，無需再手動設定成本。")
+
 elif selected_tab == "🧪 實驗分頁":
     st.markdown("### 🧪 依時間的庫存警示與分析（實驗）")
     with st.expander("📌 系統前提（核心假設）", expanded=True):
@@ -3619,53 +3727,46 @@ elif selected_tab == "🧪 實驗分頁":
         st.warning("📭 尚無每日資料，請先產生模擬資料。")
 
 elif selected_tab == "📊 ROI 實驗":
-    # ROI 實驗分頁：秒數投資效率（實驗性，不寫入資料庫；本頁使用 mock daily_inventory）
+    # ROI 實驗分頁：秒數投資效率；成本由「媒體秒數與採購」分頁的購買價格÷購買秒數換算，無需手動設成本
     st.markdown("### 📊 ROI 實驗分頁（秒數投資效率）")
-    st.caption("本頁使用模擬資料、不寫入任何資料庫；成本輸入僅存於 session，供評估「投資秒數避免浪費」的 ROI。")
+    st.caption("成本由「📋 媒體秒數與採購」分頁的購買價格 ÷ 購買秒數自動換算；本頁使用模擬 daily_inventory，不寫入資料庫。")
     with st.expander("📌 核心前提", expanded=True):
         st.markdown("""
 1. 當月未使用之秒數於月底視為 **100% 浪費（不可逆）**
 2. ROI 衡量的是「**避免浪費的營運價值**」，不是廣告成效
 3. 只有「原本會浪費的秒數被消化」才算 ROI 貢獻
-4. 本頁為實驗用途，允許假設成本與簡化邏輯
-5. 秒數成本若系統不存在，可於下方即時輸入模擬
+4. 本頁為實驗用途；**每秒成本 = 該月購買價格 ÷ 該月購買秒數**（來自媒體秒數與採購分頁）
         """)
+    roi_year = st.number_input("ROI 參考年度（用於取採購成本）", min_value=2020, max_value=2030, value=datetime.now().year, key="roi_year")
+    roi_month = st.number_input("ROI 參考月份（用於取採購成本）", min_value=1, max_value=12, value=datetime.now().month, key="roi_month")
     df_roi = _build_roi_mock_daily_inventory()
     would_be_wasted = get_would_be_wasted_seconds(df_roi)
     total_rescuable = sum(would_be_wasted.values())
 
-    # 區塊 A：本月浪費總覽
-    st.markdown("---")
-    st.markdown("#### 🔝 本月浪費總覽（可救援浪費 = past + emergency）")
-    st.metric("可救援浪費秒數（past + emergency）", f"{int(total_rescuable):,} 店秒")
-    st.caption(f"轉譯：**{_seconds_to_spot_label(total_rescuable)}**")
-
-    # 區塊 B：秒數成本實驗設定（兩層：系統預設 / 實驗輸入）
-    st.markdown("#### 🧪 秒數成本實驗設定")
+    # 成本來源：採購資料換算；若無則 fallback 實驗輸入
     if "roi_media_cost" not in st.session_state:
         st.session_state["roi_media_cost"] = {}
     media_list = sorted(df_roi["media_platform"].unique().tolist())
-    for mp in media_list:
-        sys_cost = SYSTEM_MEDIA_COST_PER_SECOND.get(mp)
-        if sys_cost is not None:
-            st.caption(f"**{mp}**：使用系統成本 = {sys_cost} 元/秒（不顯示輸入框）")
-        else:
-            default = st.session_state["roi_media_cost"].get(mp, 2.0)
-            val = st.number_input(
-                f"{mp} 每秒成本（元，實驗輸入）",
-                min_value=0.1,
-                max_value=20.0,
-                value=float(default),
-                step=0.1,
-                key=f"roi_cost_{mp}",
-            )
-            st.session_state["roi_media_cost"][mp] = val
-            st.caption(f"**{mp}**：實驗輸入成本 = {val} 元/秒")
 
     def get_cost_for_media(media):
+        row = get_platform_monthly_purchase(media, roi_year, roi_month)
+        if row is not None and row[0] and row[0] > 0:
+            return row[1] / row[0]
         if media in SYSTEM_MEDIA_COST_PER_SECOND:
             return SYSTEM_MEDIA_COST_PER_SECOND[media]
         return st.session_state.get("roi_media_cost", {}).get(media, 2.0)
+
+    with st.expander("📌 成本來源說明（可補填無採購資料的媒體）", expanded=False):
+        st.caption("優先使用「媒體秒數與採購」分頁的該年該月資料：每秒成本 = 購買價格 ÷ 購買秒數。若某媒體尚無採購資料，可於下方補填每秒成本（僅本頁 session）。")
+        for mp in media_list:
+            row = get_platform_monthly_purchase(mp, roi_year, roi_month)
+            if row is not None and row[0] and row[0] > 0:
+                cost = row[1] / row[0]
+                st.caption(f"**{mp}**：採購換算 = {row[1]:,.0f} 元 ÷ {row[0]:,} 秒 ≈ **{cost:.2f} 元/秒**")
+            else:
+                val = st.number_input(f"{mp} 每秒成本（元，補填）", min_value=0.1, max_value=20.0, value=float(st.session_state["roi_media_cost"].get(mp, 2.0)), step=0.1, key=f"roi_cost_{mp}")
+                st.session_state["roi_media_cost"][mp] = val
+                st.caption(f"**{mp}**：實驗補填 = {val} 元/秒")
 
     # 區塊 C：媒體別 ROI 實驗表
     st.markdown("#### 🧠 媒體別 ROI 實驗表")
