@@ -131,6 +131,13 @@ def init_db():
             if 'seconds_type' not in current_cols:
                 c.execute("ALTER TABLE orders ADD COLUMN seconds_type TEXT")
                 conn.commit()
+            # 遷移：專案實收金額（同一專案/合約填同一數字）、拆分金額（依比例拆分，ROI 用此計算）
+            if 'project_amount_net' not in current_cols:
+                c.execute("ALTER TABLE orders ADD COLUMN project_amount_net REAL")
+                conn.commit()
+            if 'split_amount' not in current_cols:
+                c.execute("ALTER TABLE orders ADD COLUMN split_amount REAL")
+                conn.commit()
     
     # 建立訂單主表（如果不存在或已刪除）
     if not exists:
@@ -149,7 +156,9 @@ def init_db():
                 amount_net REAL,
                 updated_at TIMESTAMP,
                 contract_id TEXT,
-                seconds_type TEXT
+                seconds_type TEXT,
+                project_amount_net REAL,
+                split_amount REAL
             )
         ''')
     
@@ -278,6 +287,38 @@ def load_platform_monthly_purchase_all_media_for_year(year):
         out[mp][mo] = (sec, pr)
     conn.close()
     return out
+
+
+def generate_mock_platform_purchase_for_year(year):
+    """
+    產生某年度、各媒體 1～12 月的模擬採購資料（購買秒數與購買價格），數值合理、不爆量。
+    會寫入 platform_monthly_purchase 並同步 platform_monthly_capacity。
+    回傳 (success: bool, message: str)
+    """
+    import calendar
+    # 各媒體基準：月購買秒數（店秒）、約略單價（元/秒），依月份 ±10% 變化
+    base_per_media = {
+        '全家廣播(企頻)': (1_600_000, 2.0),
+        '全家新鮮視': (1_300_000, 2.2),
+        '家樂福超市': (900_000, 2.4),
+        '家樂福量販店': (700_000, 2.1),
+    }
+    try:
+        for mp in MEDIA_PLATFORM_OPTIONS:
+            base_sec, base_price_per_sec = base_per_media.get(mp, (1_000_000, 2.0))
+            for m in range(1, 13):
+                # 依月份略變：約 0.92～1.08 倍，讓每月不同但穩定
+                var = 0.92 + (hash((year, mp, m)) % 17) / 100.0
+                sec = int(base_sec * var)
+                sec = max(100_000, min(sec, 5_000_000))
+                price_per_sec = base_price_per_sec * (0.95 + (hash((year, mp, m + 10)) % 11) / 100.0)
+                price_per_sec = max(0.8, min(price_per_sec, 4.0))
+                price = int(sec * price_per_sec)
+                price = max(50_000, min(price, 15_000_000))
+                set_platform_monthly_purchase(mp, year, m, sec, price)
+        return True, f"已產生 {len(MEDIA_PLATFORM_OPTIONS)} 個媒體、{year} 年 1～12 月模擬採購資料（已寫入並同步表3 每日可用秒數）"
+    except Exception as e:
+        return False, str(e)
 
 def load_platform_settings():
     """從資料庫載入平台設定（優先使用資料庫中的設定）"""
@@ -449,6 +490,19 @@ def sanitize_dataframe_for_display(df):
             
             df[col] = df[col].apply(safe_convert)
     return df
+
+
+def _styler_one_decimal(df):
+    """各分頁表格用：數值欄位顯示最多小數點第一位。回傳 Styler 供 st.dataframe 使用。"""
+    if df is None:
+        return None
+    if df.empty:
+        return df.style
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if not num_cols:
+        return df.style
+    return df.style.format({c: "{:.1f}" for c in num_cols})
+
 
 def read_cue_excel(file_content, max_rows=100):
     """
@@ -1258,8 +1312,9 @@ def generate_mock_orders_2026(n=200):
     產生 2026 年模擬訂單，模擬「一份合約因多平台/多區域/多秒數/多檔次而拆成多列」的真實情境。
     先產生若干「合約」，每份合約再拆成多筆訂單列（不同平台、區域、秒數、檔次、秒數用途），總筆數約 n。
     同一合約內可有多種秒數用途；未拆分的一列只會有一種類型。
+    模擬「專案實收金額」（同一合約同值），實收金額不模擬（填 0）。
     回傳 list of tuples:
-    (id, platform, client, product, sales, company, start_date, end_date, seconds, spots, amount_net, updated_at, contract_id, seconds_type)
+    (id, platform, client, product, sales, company, start_date, end_date, seconds, spots, amount_net=0, updated_at, contract_id, seconds_type, project_amount_net)
     """
     random.seed()
     orders = []
@@ -1290,12 +1345,8 @@ def generate_mock_orders_2026(n=200):
         low_rows = max(1, min(4, remaining))
         high_rows = min(15, remaining)
         n_rows = random.randint(low_rows, high_rows)
-        amount_pool = random.randint(80, 400) * 1000 * n_rows  # 整份合約總額
-        row_amounts = []
-        for _ in range(n_rows - 1):
-            row_amounts.append(max(10000, amount_pool // n_rows + random.randint(-15, 15) * 1000))
-        remainder = amount_pool - sum(row_amounts)
-        row_amounts.append(max(10000, remainder))
+        # 專案實收金額：同一合約一筆總額，每列都填同一數字；實收金額不模擬（0）
+        project_amount_net = max(120000, random.randint(120, 400) * 1000 * n_rows)
         for r in range(n_rows):
             if row_count >= n:
                 break
@@ -1305,9 +1356,8 @@ def generate_mock_orders_2026(n=200):
             spots = random.randint(2, 36)
             if spots % 2 != 0:
                 spots += 1
-            amount_net = row_amounts[r]
             seconds_type = random.choice(SECONDS_USAGE_TYPES)  # 同一合約內每列可不同類型
-            orders.append((uid, platform, client, product, sales, company, start_date, end_date, seconds, spots, amount_net, updated_at, contract_id, seconds_type))
+            orders.append((uid, platform, client, product, sales, company, start_date, end_date, seconds, spots, 0, updated_at, contract_id, seconds_type, project_amount_net))
             row_count += 1
         if row_count >= n:
             break
@@ -1316,6 +1366,7 @@ def generate_mock_orders_2026(n=200):
 def load_mock_data_to_db(n=200):
     """
     產生 n 筆 2026 模擬資料並寫入 orders，同時建立 ad_flight_segments。
+    模擬專案實收金額（同一合約同值），實收金額不模擬（0）；寫入後依比例自動計算拆分金額。
     回傳 (success: bool, message: str)
     """
     init_db()
@@ -1325,11 +1376,12 @@ def load_mock_data_to_db(n=200):
     try:
         c.execute("BEGIN TRANSACTION")
         c.execute("DELETE FROM orders")
+        # t = (id, platform, ..., amount_net=0, updated_at, contract_id, seconds_type, project_amount_net)；拆分金額先 NULL，稍後計算
         c.executemany("""
             INSERT OR REPLACE INTO orders
-            (id, platform, client, product, sales, company, start_date, end_date, seconds, spots, amount_net, updated_at, contract_id, seconds_type)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, orders)
+            (id, platform, client, product, sales, company, start_date, end_date, seconds, spots, amount_net, updated_at, contract_id, seconds_type, project_amount_net, split_amount)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, [(*t, None) for t in orders])
         conn.commit()
         conn.close()
         conn_read = get_db_connection()
@@ -1337,7 +1389,12 @@ def load_mock_data_to_db(n=200):
         conn_read.close()
         custom_settings = load_platform_settings()
         build_ad_flight_segments(df_orders, custom_settings, write_to_db=True)
-        return True, f"已產生 {len(orders)} 筆 2026 年模擬資料"
+        # 依專案實收金額與使用秒數比例計算並寫回拆分金額
+        contracts_with_project = df_orders.loc[df_orders['project_amount_net'].notna() & (pd.to_numeric(df_orders['project_amount_net'], errors='coerce') > 0), 'contract_id'].dropna().unique()
+        for cid in contracts_with_project:
+            if cid:
+                _compute_and_save_split_amount_for_contract(str(cid))
+        return True, f"已產生 {len(orders)} 筆 2026 年模擬資料（專案實收金額＋自動計算拆分金額）"
     except Exception as e:
         conn.rollback()
         conn.close()
@@ -1443,6 +1500,12 @@ def _sheet_row_to_order(row, row_index, col_map):
     company = get('company') or get('公司')
     contract_id = get('contract_id') or get('合約編號')
     seconds_type = get('seconds_type') or get('秒數用途') or '銷售秒數'
+    try:
+        project_amount_net = float(get('project_amount_net') or get('專案實收金額') or 0)
+    except (ValueError, TypeError):
+        project_amount_net = 0
+    if project_amount_net <= 0:
+        project_amount_net = None
     updated_at = get('updated_at') or get('提交日') or datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     if not updated_at or updated_at == '':
         updated_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -1453,7 +1516,7 @@ def _sheet_row_to_order(row, row_index, col_map):
         updated_at = updated_at + " 00:00:00" if len(updated_at) == 10 else updated_at
     order_id = f"gs_{row_index}_{contract_id or row_index}_{platform}_{start_date}".replace(" ", "_")[:200]
     return (order_id, platform, client or '', product or '', sales or '', company or '',
-            start_date, end_date, seconds, spots, amount_net, updated_at, contract_id or None, seconds_type or '銷售秒數')
+            start_date, end_date, seconds, spots, amount_net, updated_at, contract_id or None, seconds_type or '銷售秒數', project_amount_net)
 
 
 def import_google_sheet_to_orders(url_or_id, replace_existing=True):
@@ -1469,12 +1532,13 @@ def import_google_sheet_to_orders(url_or_id, replace_existing=True):
     df, err = _fetch_google_sheet_as_dataframe(sheet_id)
     if err:
         return False, f"無法讀取試算表：{err}"
-    # 欄位對照：表頭可能為中文
+    # 欄位對照：表頭可能為中文（專案實收金額：同合約填同一數字，匯入後系統會依比例計算拆分金額）
     col_map = {
         'platform': '平台', 'company': '公司', 'sales': '業務', 'contract_id': '合約編號',
         'client': 'HYUNDAI_CUSTIN', 'product': '素材', 'start_date': '起始日', 'end_date': '終止日',
         'seconds': '秒數', 'spots': '每天總檔次', 'amount_net': '實收金額', 'seconds_type': '秒數用途',
         'updated_at': '提交日', '客戶': 'HYUNDAI_CUSTIN', '委刊總檔數': '委刊總檔數', '委刋總檔數': '委刋總檔數',
+        'project_amount_net': '專案實收金額', '專案實收金額': '專案實收金額',
     }
     orders = []
     for i, (_, row) in enumerate(df.iterrows()):
@@ -1490,11 +1554,13 @@ def import_google_sheet_to_orders(url_or_id, replace_existing=True):
         if replace_existing:
             c.execute("DELETE FROM orders")
         for t in orders:
+            # t = (id, platform, ..., contract_id, seconds_type, project_amount_net)；拆分金額先 NULL，匯入後依專案實收計算
+            project_val = t[14] if len(t) > 14 else None
             c.execute("""
                 INSERT OR REPLACE INTO orders
-                (id, platform, client, product, sales, company, start_date, end_date, seconds, spots, amount_net, updated_at, contract_id, seconds_type)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, t)
+                (id, platform, client, product, sales, company, start_date, end_date, seconds, spots, amount_net, updated_at, contract_id, seconds_type, project_amount_net, split_amount)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (*t[:14], project_val, None))
         conn.commit()
         conn.close()
         conn_read = get_db_connection()
@@ -1502,7 +1568,12 @@ def import_google_sheet_to_orders(url_or_id, replace_existing=True):
         conn_read.close()
         custom_settings = load_platform_settings()
         build_ad_flight_segments(df_orders, custom_settings, write_to_db=True)
-        return True, f"已匯入 {len(orders)} 筆（表1結構）"
+        # 有填專案實收金額的合約：依使用秒數比例計算並寫回拆分金額
+        contracts_with_project = df_orders.loc[df_orders['project_amount_net'].notna() & (pd.to_numeric(df_orders['project_amount_net'], errors='coerce') > 0), 'contract_id'].dropna().unique()
+        for cid in contracts_with_project:
+            if cid:
+                _compute_and_save_split_amount_for_contract(str(cid))
+        return True, f"已匯入 {len(orders)} 筆（表1結構）；若有專案實收金額已自動計算拆分金額）"
     except Exception as e:
         conn.rollback()
         conn.close()
@@ -1892,9 +1963,9 @@ def build_table2_details_by_company(df_segments, df_daily, df_orders):
 
 def build_table3_monthly_control(df_daily, df_segments, custom_settings=None, year=None, month=None, monthly_capacity=None):
     """
-    表3 每月秒數控管表：依媒體平台區分，含使用秒數、空秒、使用率、可排日（顏色）
-    year, month: 若指定則只顯示該年該月；monthly_capacity: dict media_platform -> 當月每日可用秒數（向媒體購買），有則空秒用此值。
-    回傳 dict: media_platform -> DataFrame（4 列：使用秒數、空秒、使用率、可排日）
+    表3 每月秒數控管表：依媒體平台區分，含執行秒、可用秒數、使用率、可排日（顏色）
+    year, month: 若指定則只顯示該年該月；monthly_capacity: dict media_platform -> 當月每日可用秒數（向媒體購買），有則可用秒數用此值。
+    回傳 dict: media_platform -> DataFrame（4 列：執行秒、可用秒數、使用率、可排日）
     """
     if df_daily.empty or df_segments.empty:
         return {}
@@ -1932,7 +2003,7 @@ def build_table3_monthly_control(df_daily, df_segments, custom_settings=None, ye
             ].copy()
         # 每日使用秒數（依媒體平台彙總）
         used_by_date = dd.groupby('日期')['使用店秒'].sum().reindex(all_dates).fillna(0)
-        # 每日空秒：若有設定「當月每日可用秒數」則用該值，否則用 segment 產能（向量化，避免 O(dates×segments) 雙層迴圈）
+        # 每日可用秒數：若有設定「當月每日可用秒數」則用該值，否則用 segment 產能（向量化，避免 O(dates×segments) 雙層迴圈）
         set_cap = monthly_capacity.get(mp)
         if set_cap is not None and set_cap > 0:
             cap_series = pd.Series([int(set_cap)] * len(all_dates), index=all_dates)
@@ -1947,22 +2018,25 @@ def build_table3_monthly_control(df_daily, df_segments, custom_settings=None, ye
                 cap_list.append(np.sum(scs[mask]))
             cap_series = pd.Series(cap_list, index=all_dates)
         used_by_date = used_by_date.reindex(all_dates).fillna(0)
-        # 使用率 %（空秒為 0 時為 0）
+        # 使用率 %（可用秒數為 0 時為 0）
         util_series = (used_by_date / cap_series.replace(0, 1)).fillna(0) * 100
-        # 建四列：使用秒數、空秒、使用率、可排日（可排日存使用率數值供著色）
-        date_cols = [f"{d.day}" for d in all_dates]
+        # 建四列：執行秒、可用秒數、使用率、可排日；日期欄以 月/日(星期) 顯示；% 欄小數一位
+        weekday_cn = ['一', '二', '三', '四', '五', '六', '日']
+        date_cols = [f"{d.month}/{d.day}({weekday_cn[d.weekday()]})" for d in all_dates]
         total_used = used_by_date.sum()
         total_cap = cap_series.sum()
-        row_used = {'授權': '主管', '項目': mp, '秒數': int(total_used), '%': round(total_used / (total_cap or 1) * 100, 1)}
-        row_cap = {'授權': '主管', '項目': '空秒', '秒數': int(total_cap), '%': round((total_cap - total_used) / (total_cap or 1) * 100, 1)}
-        row_util = {'授權': '主管', '項目': '使用率', '秒數': '', '%': 100}
-        row_color = {'授權': '業務', '項目': '可排日', '秒數': '綠50%+ 黃70%+ 紅100%+', '%': ''}
+        pct_used = round(total_used / (total_cap or 1) * 100, 1)
+        pct_unused = round((total_cap - total_used) / (total_cap or 1) * 100, 1)
+        row_used = {'授權': '總經理', '項目': '執行秒', '秒數': int(total_used), '%': f"{pct_used:.1f}"}
+        row_cap = {'授權': '總經理', '項目': '可用秒數', '秒數': int(total_cap), '%': f"{pct_unused:.1f}"}
+        row_util = {'授權': '總經理', '項目': '使用率', '秒數': '', '%': '100.0'}
+        row_color = {'授權': '業務', '項目': '可排日', '秒數': '', '%': ''}
         for i in range(len(all_dates)):
             d = all_dates[i]
             row_used[date_cols[i]] = int(used_by_date.iloc[i]) if i < len(used_by_date) else 0
             row_cap[date_cols[i]] = int(cap_series.iloc[i]) if i < len(cap_series) else 0
             u = util_series.iloc[i] if i < len(util_series) else 0
-            row_util[date_cols[i]] = f"{u:.0f}%" if pd.notna(u) else "0%"
+            row_util[date_cols[i]] = f"{round(float(u), 1)}%" if pd.notna(u) else "0%"
             row_color[date_cols[i]] = float(u) if pd.notna(u) else 0
         result[mp] = pd.DataFrame([row_used, row_cap, row_util, row_color])
     return result
@@ -2098,6 +2172,91 @@ SYSTEM_MEDIA_COST_PER_SECOND = {
 STANDARD_VALUE_PER_SECOND = 3.0  # 估算「避免浪費的價值」
 
 
+def _compute_and_save_split_amount_for_contract(contract_key):
+    """
+    依「專案實收金額」與各訂單使用秒數比例，計算並寫回每筆訂單的 拆分金額。
+    同一合約（contract_key）內，拆分金額 = 專案實收金額 × (該訂單總店秒 / 合約總店秒)。
+    """
+    if not contract_key:
+        return
+    try:
+        conn = get_db_connection()
+        df_ord = pd.read_sql(
+            "SELECT id, contract_id, project_amount_net FROM orders WHERE contract_id = ? OR id = ?",
+            conn, params=(str(contract_key), str(contract_key))
+        )
+        if df_ord.empty:
+            conn.close()
+            return
+        project_amt = pd.to_numeric(df_ord['project_amount_net'].iloc[0], errors='coerce')
+        if pd.isna(project_amt) or project_amt <= 0:
+            conn.close()
+            return
+        order_ids = df_ord['id'].tolist()
+        placeholders = ",".join(["?"] * len(order_ids))
+        df_seg = pd.read_sql(
+            f"SELECT source_order_id, total_store_seconds FROM ad_flight_segments WHERE source_order_id IN ({placeholders})",
+            conn, params=order_ids
+        )
+        conn.close()
+        if df_seg.empty:
+            return
+        order_seconds = df_seg.groupby('source_order_id')['total_store_seconds'].sum().to_dict()
+        total_sec = sum(order_seconds.values()) or 1
+        conn = get_db_connection()
+        for oid in order_ids:
+            sec = order_seconds.get(oid, 0) or 0
+            split_val = project_amt * (sec / total_sec)
+            conn.execute("UPDATE orders SET split_amount = ? WHERE id = ?", (round(split_val, 2), oid))
+        conn.commit()
+        conn.close()
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def get_revenue_per_media_allocated_by_seconds():
+    """
+    從訂單＋檔次段計算「各媒體實收金額」：優先使用「拆分金額」；若無則依各媒體使用秒數佔該合約總秒數比例拆分「實收金額」。
+    回傳 dict: media_platform -> 分配後實收金額(int)。若無資料或錯誤則回傳 {}。
+    """
+    try:
+        conn = get_db_connection()
+        df_ord = pd.read_sql("SELECT id, contract_id, amount_net, split_amount FROM orders", conn)
+        df_seg = pd.read_sql("SELECT source_order_id, media_platform, total_store_seconds FROM ad_flight_segments WHERE media_platform IS NOT NULL AND total_store_seconds IS NOT NULL", conn)
+        conn.close()
+    except Exception:
+        return {}
+    if df_ord.empty or df_seg.empty:
+        return {}
+    df_seg = df_seg.merge(df_ord, left_on='source_order_id', right_on='id', how='left')
+    df_seg['split_amount'] = pd.to_numeric(df_seg['split_amount'], errors='coerce').fillna(0)
+    # 若有任一訂單有拆分金額，則各媒體實收 = 依訂單之 split_amount 依 media_platform 加總
+    use_split = (df_seg['split_amount'] > 0).any()
+    if use_split:
+        rev_by_media = df_seg.groupby('media_platform')['split_amount'].sum()
+        return {k: int(round(v)) for k, v in rev_by_media.items() if v and v > 0}
+    # 否則沿用原邏輯：依合約實收金額按秒數比例拆分
+    df_seg['contract_key'] = df_seg['contract_id'].fillna(df_seg['source_order_id'])
+    df_seg['amount_net'] = pd.to_numeric(df_seg['amount_net'], errors='coerce').fillna(0)
+    contract_revenue = df_ord.copy()
+    contract_revenue['contract_key'] = contract_revenue['contract_id'].fillna(contract_revenue['id'])
+    contract_revenue['amount_net'] = pd.to_numeric(contract_revenue['amount_net'], errors='coerce').fillna(0)
+    contract_total = contract_revenue.groupby('contract_key')['amount_net'].sum().to_dict()
+    seg_seconds = df_seg.groupby(['contract_key', 'media_platform'])['total_store_seconds'].sum().reset_index()
+    contract_seconds = df_seg.groupby('contract_key')['total_store_seconds'].sum().to_dict()
+    revenue_per_media = {}
+    for (contract_key, media_platform), grp in seg_seconds.groupby(['contract_key', 'media_platform']):
+        media_sec = int(grp['total_store_seconds'].sum())
+        total_sec = contract_seconds.get(contract_key, 0) or 1
+        rev = contract_total.get(contract_key, 0)
+        allocated = rev * (media_sec / total_sec)
+        revenue_per_media[media_platform] = revenue_per_media.get(media_platform, 0) + allocated
+    return {k: int(round(v)) for k, v in revenue_per_media.items()}
+
+
 def _build_roi_mock_daily_inventory():
     """Mock daily_inventory 供 ROI 實驗頁使用：2–3 媒體、10–20 天。"""
     media_platforms = ['全家新鮮視', '全家廣播(企頻)', '家樂福超市']
@@ -2117,6 +2276,9 @@ def _build_roi_mock_daily_inventory():
             used = int(cap * (0.5 + 0.3 * (d % 5) / 5))
             unused = max(0, cap - used)
             usage_rate = (used / cap) if cap else 0
+            # 模擬實收金額：依使用秒數 × 模擬單價（約 2~4 元/秒，依媒體與日略變）
+            unit = 2.0 + (hash((d, mp)) % 80) / 40.0
+            amount_net = int(used * unit)
             rows.append({
                 'date': dt,
                 'media_platform': mp,
@@ -2125,6 +2287,7 @@ def _build_roi_mock_daily_inventory():
                 'unused_seconds': unused,
                 'usage_rate': usage_rate,
                 'time_bucket': bucket,
+                'amount_net': amount_net,
             })
     return pd.DataFrame(rows)
 
@@ -2166,10 +2329,12 @@ def simulate_absorbed_waste(media, invested_seconds, df):
     return int(absorbed)
 
 
-def calculate_roi(media, invested_seconds, cost_per_second, df, standard_value=STANDARD_VALUE_PER_SECOND):
+def calculate_roi(media, invested_seconds, cost_per_second, df, standard_value=STANDARD_VALUE_PER_SECOND, revenue_override=None):
     """
     計算 ROI 相關指標。注意除以 0 容錯。
-    回傳 dict: investment_cost, absorbed_waste_seconds, war, wav, roi
+    投報率（ROI）以「實收金額」為主：(實收金額 - 投資成本) / 投資成本；若無實收則改以 WAV/成本。
+    revenue_override: 可選，若提供則直接作為該媒體之實收（用於「同一合約多媒體」時已依秒數比例分配之實收）。
+    回傳 dict: investment_cost, absorbed_waste_seconds, war, wav, revenue(實收金額), roi
     """
     if invested_seconds <= 0 or cost_per_second is None or cost_per_second <= 0:
         return {
@@ -2177,18 +2342,36 @@ def calculate_roi(media, invested_seconds, cost_per_second, df, standard_value=S
             'absorbed_waste_seconds': 0,
             'war': 0.0,
             'wav': 0.0,
+            'revenue': 0,
             'roi': 0.0,
         }
     absorbed = simulate_absorbed_waste(media, invested_seconds, df)
     investment_cost = invested_seconds * cost_per_second
     war = (absorbed / invested_seconds) if invested_seconds else 0
     wav = absorbed * standard_value
-    roi = (wav / investment_cost) if investment_cost else 0
+    # 實收金額：優先使用已分配之 revenue_override（同一合約多媒體時依秒數比例拆分）；否則從 df 加總
+    revenue = 0
+    if revenue_override is not None:
+        revenue = int(revenue_override) if revenue_override else 0
+    elif not df.empty and 'media_platform' in df.columns:
+        rev_col = None
+        for c in ('amount_net', '實收金額'):
+            if c in df.columns:
+                rev_col = c
+                break
+        if rev_col is not None:
+            revenue = int(df.loc[df['media_platform'] == media, rev_col].sum())
+    # 投報率：優先 (實收 - 成本) / 成本；無實收時改以 wav / 成本
+    if revenue > 0 and investment_cost > 0:
+        roi = (revenue - investment_cost) / investment_cost
+    else:
+        roi = (wav / investment_cost) if investment_cost else 0
     return {
         'investment_cost': investment_cost,
         'absorbed_waste_seconds': absorbed,
         'war': war,
         'wav': wav,
+        'revenue': revenue,
         'roi': roi,
     }
 
@@ -2301,6 +2484,124 @@ def build_annual_seconds_summary(df_daily, year, monthly_capacity_loader=None):
     return {'top_usage_df': top_usage_df, 'entities': entities_out}
 
 
+def _build_annual_summary_pdf(annual, summary_year):
+    """
+    將年度使用秒數總表產出為 PDF 二進位內容。使用系統中文字型以正確顯示中文。
+    回傳 bytes，若失敗回傳 None。
+    """
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+    except ImportError:
+        return None
+    buf = io.BytesIO()
+    # 註冊中文字型並決定表格/段落使用的字型名稱（優先 .ttf，.ttc 需指定 subfontIndex）
+    pdf_font_name = None
+    windir = os.environ.get('WINDIR', 'C:/Windows')
+    font_candidates = [
+        (os.path.join(windir, 'Fonts', 'msjh.ttf'), 'CJK'),      # 微軟正黑體 .ttf
+        (os.path.join(windir, 'Fonts', 'mingliu.ttc'), 'CJK'),  # 細明體
+        (os.path.join(windir, 'Fonts', 'msjh.ttc'), 'CJK'),     # 微軟正黑體 .ttc
+        (os.path.join(windir, 'Fonts', 'simsun.ttc'), 'CJK'),   # 宋體
+        (os.path.join(windir, 'Fonts', 'simhei.ttf'), 'CJK'),   # 黑體
+        ('/System/Library/Fonts/PingFang.ttc', 'CJK'),
+        ('/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc', 'CJK'),
+    ]
+    for font_path, name in font_candidates:
+        if not os.path.isfile(font_path):
+            continue
+        try:
+            if font_path.lower().endswith('.ttc'):
+                pdfmetrics.registerFont(TTFont(name, font_path, subfontIndex=0))
+            else:
+                pdfmetrics.registerFont(TTFont(name, font_path))
+            pdf_font_name = name
+            break
+        except Exception:
+            continue
+    if not pdf_font_name:
+        try:
+            from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+            pdfmetrics.registerFont(UnicodeCIDFont('HeiseiMin-W3'))
+            pdf_font_name = 'HeiseiMin-W3'
+        except Exception:
+            pass
+    if not pdf_font_name:
+        return None
+    try:
+        doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=40, leftMargin=40, topMargin=40, bottomMargin=40)
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            name='CJKTitle',
+            parent=styles['Title'],
+            fontName=pdf_font_name,
+            fontSize=16,
+        )
+        heading_style = ParagraphStyle(
+            name='CJKHeading2',
+            parent=styles['Heading2'],
+            fontName=pdf_font_name,
+            fontSize=12,
+        )
+        story = []
+        title = Paragraph(f"<b>年度使用秒數總表 {summary_year}</b>", title_style)
+        story.append(title)
+        story.append(Spacer(1, 12))
+
+        def _df_to_table_data(df):
+            if df is None or df.empty:
+                return []
+            return [[str(x) for x in row] for row in df.values.tolist()]
+
+        def _add_table(data, col_widths=None):
+            if not data:
+                return
+            t = Table(data)
+            ncols = len(data[0]) if data else 0
+            if col_widths is None:
+                col_widths = [max(40, 400 // ncols)] * ncols if ncols else []
+            t.setStyle(TableStyle([
+                ('FONTNAME', (0, 0), (-1, -1), pdf_font_name),
+                ('FONTSIZE', (0, 0), (-1, -1), 8),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ]))
+            story.append(t)
+            story.append(Spacer(1, 10))
+
+        if annual.get('top_usage_df') is not None and not annual['top_usage_df'].empty:
+            top_df = annual['top_usage_df']
+            data = [list(top_df.columns)] + _df_to_table_data(top_df)
+            _add_table(data)
+        for ent in ANNUAL_SUMMARY_ENTITY_LABELS:
+            block = annual['entities'].get(ent)
+            if not block:
+                continue
+            story.append(Paragraph(f"<b>{summary_year} {ent}</b>", heading_style))
+            story.append(Spacer(1, 6))
+            by_type = block['by_type_df']
+            data = [list(by_type.columns)] + _df_to_table_data(by_type)
+            _add_table(data)
+            summary_table = pd.DataFrame([
+                block['used_row'],
+                block['unused_row'],
+                block['usage_rate_row'],
+            ])
+            data = [list(summary_table.columns)] + _df_to_table_data(summary_table)
+            _add_table(data)
+            story.append(Spacer(1, 8))
+        doc.build(story)
+        buf.seek(0)
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
 def _build_table1_from_segments(df_segments: pd.DataFrame, custom_settings=None, df_orders_info=None) -> pd.DataFrame:
     """
     從 segments 表建立表1（segments 已經正確拆解）
@@ -2377,12 +2678,13 @@ def _build_table1_from_segments(df_segments: pd.DataFrame, custom_settings=None,
         _contract_id = row.get('contract_id')
         _display_contract = (_contract_id if (pd.notna(_contract_id) and _contract_id) else row.get('source_order_id', ''))
         base_row = {
+            '_source_order_id': row.get('source_order_id'),  # 供合併 orders 取得實收金額用，稍後移除
             '業務': row.get('sales', ''),
             '主管': '',  # 預留欄位
             '合約編號': _display_contract,
             '公司': row.get('company', ''),
-            '實收金額': 0,  # 需要從 orders 取得
-            '除佣實收': 0,  # 需要從 orders 取得
+            '實收金額': 0,  # 由 orders 依 source_order_id 合併後填入
+            '除佣實收': 0,
             '製作成本': '',  # 預留欄位
             '獎金%': '',  # 預留欄位
             '核定獎金': '',  # 預留欄位
@@ -2435,22 +2737,37 @@ def _build_table1_from_segments(df_segments: pd.DataFrame, custom_settings=None,
     # === 轉換為 DataFrame ===
     df_excel = pd.DataFrame(result_rows)
     
-    # === 從 orders 取得實收金額 ===
+    # === 從 orders 取得實收金額、專案實收金額、拆分金額（以 source_order_id 對應 orders.id）===
     conn = get_db_connection()
     try:
-        df_orders_amount = pd.read_sql("SELECT id, amount_net FROM orders", conn)
+        df_orders_amount = pd.read_sql("SELECT id, amount_net, project_amount_net, split_amount FROM orders", conn)
         conn.close()
-        
-        # 合併實收金額
-        df_excel = df_excel.merge(df_orders_amount, left_on='合約編號', right_on='id', how='left', suffixes=('', '_order'))
+        df_excel = df_excel.merge(
+            df_orders_amount, left_on='_source_order_id', right_on='id', how='left', suffixes=('', '_order')
+        )
         df_excel['實收金額'] = df_excel['amount_net'].fillna(0).astype(int)
         df_excel['除佣實收'] = df_excel['amount_net'].fillna(0).astype(int)
-        df_excel = df_excel.drop(columns=['id', 'amount_net'], errors='ignore')
-    except:
-        pass
+        df_excel['專案實收金額'] = pd.to_numeric(df_excel['project_amount_net'], errors='coerce').fillna(0)
+        df_excel['拆分金額'] = pd.to_numeric(df_excel['split_amount'], errors='coerce').fillna(0)
+        df_excel = df_excel.drop(columns=['id', 'amount_net', 'project_amount_net', 'split_amount', '_source_order_id'], errors='ignore')
+    except Exception:
+        try:
+            conn = get_db_connection()
+            df_orders_amount = pd.read_sql("SELECT id, amount_net FROM orders", conn)
+            conn.close()
+            df_excel = df_excel.merge(df_orders_amount, left_on='_source_order_id', right_on='id', how='left')
+            df_excel['實收金額'] = df_excel['amount_net'].fillna(0).astype(int)
+            df_excel['除佣實收'] = df_excel['amount_net'].fillna(0).astype(int)
+            df_excel = df_excel.drop(columns=['id', 'amount_net', '_source_order_id'], errors='ignore')
+        except Exception:
+            df_excel = df_excel.drop(columns=['_source_order_id'], errors='ignore')
+        if '專案實收金額' not in df_excel.columns:
+            df_excel['專案實收金額'] = 0
+        if '拆分金額' not in df_excel.columns:
+            df_excel['拆分金額'] = 0
     
-    # === 重新排列欄位順序（含公司別、媒體平台）===
-    base_columns = ['業務', '主管', '合約編號', '公司', '實收金額', '除佣實收', '製作成本', '獎金%', 
+    # === 重新排列欄位順序（含公司別、媒體平台、專案實收金額、拆分金額）===
+    base_columns = ['業務', '主管', '合約編號', '公司', '實收金額', '除佣實收', '專案實收金額', '拆分金額', '製作成本', '獎金%', 
                     '核定獎金', '加發獎金', '業務基金', '協力基金', '秒數用途', '提交日', 
                     'HYUNDAI_CUSTIN', '秒數', '素材', '起始日', '終止日', '走期天數', '區域', '媒體平台']
     hour_columns = [str(h) for h in [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 0, 1]]
@@ -2780,19 +3097,19 @@ if df_daily.empty and not df_orders.empty:
         df_daily = _explode_segments_to_daily_cached(df_seg_main) if not df_seg_main.empty else pd.DataFrame()
 
 # --- 分頁呈現（角色導向入口 + 只渲染當前分頁）---
-TAB_OPTIONS = ["📋 表1-資料", "📅 表2-秒數明細", "📊 表3-庫存熱力圖", "📈 總結表", "📉 總結表圖表", "📋 媒體秒數與採購", "🧪 實驗分頁", "📊 ROI 實驗"]
-# 各角色可見分頁：行政主管=全部(預設)、業務=表1+表3(唯讀)、主管=表3+總結表+表1(含逐筆管理)
+TAB_OPTIONS = ["📋 表1-資料", "📅 表2-秒數明細", "📊 表3-每日庫存", "📈 總結表", "📉 總結表圖表", "📊 分公司×媒體 每月秒數", "📋 媒體秒數與採購", "🧪 實驗分頁", "📊 ROI 實驗"]
+# 各角色可見分頁：行政主管=全部(預設)、業務=表1+表3(唯讀)、總經理=總結表+表3+表2(不呈現表1)
 TAB_OPTIONS_BY_ROLE = {
     "行政主管": TAB_OPTIONS,  # 擁有所有權限，預設角色
-    "業務": ["📋 表1-資料", "📊 表3-庫存熱力圖"],
-    "主管": ["📊 表3-庫存熱力圖", "📈 總結表", "📉 總結表圖表", "📋 表1-資料", "📋 媒體秒數與採購", "🧪 實驗分頁", "📊 ROI 實驗"],
+    "業務": ["📋 表1-資料", "📊 表3-每日庫存"],
+    "總經理": ["📈 總結表", "📊 表3-每日庫存", "📅 表2-秒數明細", "📉 總結表圖表", "📊 分公司×媒體 每月秒數", "📋 媒體秒數與採購", "🧪 實驗分頁", "📊 ROI 實驗"],
 }
 
 st.markdown("#### 你現在的身份是？")
 role = st.radio(
     "身份",
-    options=["行政主管", "業務", "主管"],
-    format_func=lambda x: {"行政主管": "🗂 行政主管", "業務": "🧑‍💼 業務", "主管": "👔 主管"}[x],
+    options=["行政主管", "業務", "總經理"],
+    format_func=lambda x: {"行政主管": "🗂 行政主管", "業務": "🧑‍💼 業務", "總經理": "👔 總經理"}[x],
     horizontal=True,
     key="user_role",
     label_visibility="collapsed",
@@ -2813,7 +3130,7 @@ def _render_tab3(role_readonly=False):
     df_daily_t3 = _explode_segments_to_daily_cached(df_seg_t3) if not df_seg_t3.empty else pd.DataFrame()
 
     st.markdown("### 📊 每月秒數控管表（對齊 Excel 表3）")
-    st.caption("依媒體平台區分：使用秒數、空秒、使用率、可排日（綠 50%+／黃 70%+／紅 100%+）。可選年份月份。" + ("" if role_readonly else "主管/行政主管可設定當月各媒體「每日可用秒數」。"))
+    st.caption("依媒體平台區分：執行秒、可用秒數、使用率、可排日（綠 50%+／黃 70%+／紅 100%+）。可選年份月份。每日可用秒數請至「媒體秒數與採購」分頁設定。")
 
     default_year = datetime.now().year
     default_month = datetime.now().month
@@ -2825,29 +3142,6 @@ def _render_tab3(role_readonly=False):
             default_month = int(valid.min().month)
     sel_year = st.number_input("年份", min_value=2020, max_value=2030, value=default_year, key="table3_year")
     sel_month = st.number_input("月份", min_value=1, max_value=12, value=default_month, key="table3_month")
-
-    if not role_readonly:
-        st.markdown("#### ⚙️ 當月各媒體每日可用秒數（向媒體購買）")
-        st.caption("設定該年該月、各媒體平台的「每日可用秒數」。有設定時，表3 空秒與使用率依此計算；未設定則以店數×營業時數推算。輸入完請按「儲存」才會寫入。")
-        saved_cap = load_platform_monthly_capacity_for(sel_year, sel_month)
-        with st.form("table3_capacity_form", clear_on_submit=False):
-            cap_inputs = {}
-            cols_cap = st.columns(min(4, len(MEDIA_PLATFORM_OPTIONS)))
-            for i, mp in enumerate(MEDIA_PLATFORM_OPTIONS):
-                with cols_cap[i % len(cols_cap)]:
-                    cap_inputs[mp] = st.number_input(
-                        f"{mp} 每日可用秒數",
-                        min_value=0,
-                        value=int(saved_cap.get(mp, 0)) if saved_cap.get(mp) else 0,
-                        step=10000,
-                        key=f"table3_cap_{mp}_{sel_year}_{sel_month}"
-                    )
-            submitted = st.form_submit_button("💾 儲存當月每日可用秒數設定")
-        if submitted:
-            for mp, val in cap_inputs.items():
-                if val > 0:
-                    set_platform_monthly_capacity(mp, sel_year, sel_month, val)
-            st.success("已儲存設定")
 
     if df_daily_t3.empty or df_seg_t3.empty:
         st.warning("📭 尚無每日或檔次段資料，請先產生模擬資料。")
@@ -2890,7 +3184,7 @@ def _render_tab3(role_readonly=False):
                     month_util = float(_mu) if _mu is not None and pd.notna(_mu) else (sum(util_vals) / len(util_vals) if util_vals else 0)
                 except (TypeError, KeyError, ValueError):
                     month_util = sum(util_vals) / len(util_vals) if util_vals else 0
-                util_label = f"{month_util:.0f}%" if isinstance(month_util, (int, float)) else "—"
+                util_label = f"{round(float(month_util), 1)}%" if isinstance(month_util, (int, float)) else "—"
                 if isinstance(month_util, (int, float)) and month_util >= 100:
                     util_status = "🔴 已滿"
                     suggestion = "建議：避免再加全省案，僅可補區域。"
@@ -2910,20 +3204,31 @@ def _render_tab3(role_readonly=False):
                 for col in date_cols_t3:
                     val = df_t3.at[3, col]
                     if isinstance(val, (int, float)) and pd.notna(val):
-                        df_t3.at[3, col] = f"{val:.0f}%"
+                        df_t3.at[3, col] = f"{round(float(val), 1)}%"
                 orig_row4 = table3_data[mp].iloc[3].copy()
-                def _style_table3(row):
+                fixed_cols_t3 = ['授權', '項目', '秒數', '%']
+                # 依週分塊（每塊 6 天），欄數少、避免左右滑動；日期欄為 月/日(星期)
+                chunk_size = 6
+                date_chunks = [date_cols_t3[i:i + chunk_size] for i in range(0, len(date_cols_t3), chunk_size)]
+                def _style_chunk(row, chunk_dates):
                     out = [''] * len(row)
                     if row.name != 3:
                         return out
                     for i, c in enumerate(row.index):
-                        if c in date_cols_t3:
+                        if c in chunk_dates:
                             orig = orig_row4.get(c)
                             if isinstance(orig, (int, float)) and pd.notna(orig):
                                 out[i] = _util_color(orig)
                     return out
-                styled_t3 = df_t3.style.apply(_style_table3, axis=1)
-                st.dataframe(styled_t3, use_container_width=True, height=220)
+                # 可排日圖例拉出表格外，避免長文字造成左右滑動
+                st.caption("🟢 綠 &lt;70%　🟡 黃 70%+　🔴 紅 100%+")
+                # 一週一列：每週一塊表（全寬），垂直排列，不需左右滑動
+                for chunk in date_chunks:
+                    sub = df_t3[fixed_cols_t3 + chunk]
+                    st.caption(f"**{chunk[0]} ～ {chunk[-1]}**")
+                    _num_cols_sub = sub.select_dtypes(include=[np.number]).columns.tolist()
+                    _fmt_sub = {c: "{:.1f}" for c in _num_cols_sub} if _num_cols_sub else {}
+                    st.dataframe(sub.style.format(_fmt_sub).apply(lambda row: _style_chunk(row, chunk), axis=1), use_container_width=True)
 
                 # --- 點擊日期展開當日明細（可排日互動）---
                 if not df_daily_t3.empty and '媒體平台' in df_daily_t3.columns and '日期' in df_daily_t3.columns:
@@ -2941,7 +3246,8 @@ def _render_tab3(role_readonly=False):
                                 dd = df_daily_t3[(df_daily_t3['媒體平台'] == mp) & (df_daily_t3['日期'].dt.normalize() == target_d)]
                                 if not dd.empty:
                                     show_cols = [c for c in ['日期', '媒體平台', '公司', '業務', '客戶', '產品', '使用店秒', '秒數', '檔次'] if c in dd.columns]
-                                    st.dataframe(dd[show_cols] if show_cols else dd, use_container_width=True, height=min(200, 80 + len(dd) * 38))
+                                    _dd_show = dd[show_cols] if show_cols else dd
+                                    st.dataframe(_styler_one_decimal(_dd_show), use_container_width=True, height=min(200, 80 + len(dd) * 38))
                                 else:
                                     st.caption("該日無使用紀錄")
                             except Exception:
@@ -2986,6 +3292,22 @@ if selected_tab == "📋 表1-資料":
     if df_table1.empty:
         st.warning("📭 尚無訂單資料")
         st.stop()
+    
+    # === 實收金額顯示模式：同一合約常只收一筆，表1卻拆成多列，可選「依合約合併」只於每合約第一列顯示總額 ===
+    if '實收金額' in df_table1.columns and '合約編號' in df_table1.columns:
+        amount_display_mode = st.radio(
+            "實收金額顯示",
+            options=["依訂單列（每列顯示該筆訂單金額）", "依合約合併（每合約只顯示一筆總額於第一列）"],
+            index=0,
+            horizontal=True,
+            key="table1_amount_display_mode",
+        )
+        if "依合約合併" in amount_display_mode:
+            contract_total = df_table1.groupby('合約編號')['實收金額'].transform('sum')
+            first_in_contract = ~df_table1.duplicated('合約編號', keep='first')
+            df_table1 = df_table1.copy()
+            df_table1['實收金額'] = np.where(first_in_contract, contract_total, 0)
+            df_table1['除佣實收'] = df_table1['實收金額']
     
     # === 媒體平台切換按鈕（全家廣播(企頻)、全家新鮮視、家樂福超市、家樂福量販店）===
     if '媒體平台' in df_table1.columns:
@@ -3095,7 +3417,7 @@ if selected_tab == "📋 表1-資料":
     st.markdown("#### 📊 表1-資料（可橫向滾動查看完整欄位）")
 
     st.dataframe(
-        df_display,
+        _styler_one_decimal(df_display),
         use_container_width=True,
         height=650
     )
@@ -3162,6 +3484,8 @@ if selected_tab == "📋 表1-資料":
             new_seconds = st.selectbox("秒數", MOCK_SECONDS, key="crud_new_seconds")
             new_spots = st.number_input("檔次", min_value=2, value=10, step=2, key="crud_new_spots")
             new_amount = st.number_input("實收金額（未稅）", min_value=0, value=100000, step=10000, key="crud_new_amount")
+            new_project_amount = st.number_input("專案實收金額（同專案填同一數字，選填）", min_value=0, value=0, step=10000, key="crud_new_project_amount", help="同一合約編號多筆時填一次總額即可，系統會依使用秒數比例計算「拆分金額」")
+            new_split_amount = st.number_input("拆分金額（選填，或由專案實收自動計算）", min_value=0, value=0, step=10000, key="crud_new_split_amount", help="ROI 等計算使用此欄；有填專案實收時儲存後會自動依比例計算")
         if st.button("💾 儲存新增", key="crud_btn_add"):
             if not new_id or not new_client or not new_product:
                 st.error("請填寫訂單 ID、客戶、產品名稱")
@@ -3171,16 +3495,20 @@ if selected_tab == "📋 表1-資料":
                 conn_ins = get_db_connection()
                 try:
                     contract_id_val = (new_contract_id or '').strip() or None
+                    project_val = float(new_project_amount) if new_project_amount else None
+                    split_val = float(new_split_amount) if new_split_amount else None
                     conn_ins.execute("""
-                        INSERT INTO orders (id, platform, client, product, sales, company, start_date, end_date, seconds, spots, amount_net, updated_at, contract_id, seconds_type)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        INSERT INTO orders (id, platform, client, product, sales, company, start_date, end_date, seconds, spots, amount_net, updated_at, contract_id, seconds_type, project_amount_net, split_amount)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """, (new_id, new_platform, new_client, new_product, new_sales, new_company,
                           new_start.strftime("%Y-%m-%d"), new_end.strftime("%Y-%m-%d"),
-                          int(new_seconds), int(new_spots), float(new_amount), datetime.now().strftime("%Y-%m-%d %H:%M:%S"), contract_id_val, new_seconds_type))
+                          int(new_seconds), int(new_spots), float(new_amount), datetime.now().strftime("%Y-%m-%d %H:%M:%S"), contract_id_val, new_seconds_type, project_val, split_val))
                     conn_ins.commit()
                     df_after = pd.read_sql("SELECT * FROM orders", conn_ins)
                     conn_ins.close()
                     build_ad_flight_segments(df_after, load_platform_settings(), write_to_db=True)
+                    if project_val and project_val > 0 and contract_id_val:
+                        _compute_and_save_split_amount_for_contract(contract_id_val)
                     st.success("✅ 已新增一筆")
                     if '_table1_cache_key' in st.session_state:
                         del st.session_state['_table1_cache_key']
@@ -3222,22 +3550,30 @@ if selected_tab == "📋 表1-資料":
                     edit_seconds = st.number_input("秒數", min_value=5, max_value=60, value=int(selected_row['seconds']), key="crud_edit_seconds")
                     edit_spots = st.number_input("檔次", min_value=2, value=int(selected_row['spots']), step=2, key="crud_edit_spots")
                     edit_amount = st.number_input("實收金額（未稅）", min_value=0, value=int(selected_row['amount_net']), step=10000, key="crud_edit_amount")
+                    _proj = selected_row.get('project_amount_net')
+                    edit_project_amount = st.number_input("專案實收金額（同專案填同一數字，選填）", min_value=0, value=int(_proj) if pd.notna(_proj) and _proj else 0, step=10000, key="crud_edit_project_amount")
+                    _split = selected_row.get('split_amount')
+                    edit_split_amount = st.number_input("拆分金額（選填，或由專案實收自動計算）", min_value=0, value=int(_split) if pd.notna(_split) and _split else 0, step=10000, key="crud_edit_split_amount")
                 col_save, col_cancel, _ = st.columns([1, 1, 2])
                 with col_save:
                     if st.button("💾 儲存編輯", key="crud_btn_edit"):
                         conn_up = get_db_connection()
                         try:
                             edit_contract_id_val = (edit_contract_id or '').strip() or None
+                            project_val = float(edit_project_amount) if edit_project_amount else None
+                            split_val = float(edit_split_amount) if edit_split_amount else None
                             conn_up.execute("""
-                                UPDATE orders SET platform=?, client=?, product=?, sales=?, company=?, start_date=?, end_date=?, seconds=?, spots=?, amount_net=?, updated_at=?, contract_id=?, seconds_type=?
+                                UPDATE orders SET platform=?, client=?, product=?, sales=?, company=?, start_date=?, end_date=?, seconds=?, spots=?, amount_net=?, updated_at=?, contract_id=?, seconds_type=?, project_amount_net=?, split_amount=?
                                 WHERE id=?
                             """, (edit_platform, edit_client, edit_product, edit_sales, edit_company,
                                   edit_start.strftime("%Y-%m-%d"), edit_end.strftime("%Y-%m-%d"),
-                                  int(edit_seconds), int(edit_spots), float(edit_amount), datetime.now().strftime("%Y-%m-%d %H:%M:%S"), edit_contract_id_val, edit_seconds_type, selected_row['id']))
+                                  int(edit_seconds), int(edit_spots), float(edit_amount), datetime.now().strftime("%Y-%m-%d %H:%M:%S"), edit_contract_id_val, edit_seconds_type, project_val, split_val, selected_row['id']))
                             conn_up.commit()
                             df_after = pd.read_sql("SELECT * FROM orders", conn_up)
                             conn_up.close()
                             build_ad_flight_segments(df_after, load_platform_settings(), write_to_db=True)
+                            if project_val and project_val > 0 and edit_contract_id_val:
+                                _compute_and_save_split_amount_for_contract(edit_contract_id_val)
                             if "crud_edit_id" in st.session_state:
                                 del st.session_state["crud_edit_id"]
                             if '_table1_cache_key' in st.session_state:
@@ -3334,7 +3670,7 @@ elif selected_tab == "📅 表2-秒數明細":
         # 區塊一：依公司統計總覽
         st.markdown("#### 依公司統計")
         if not summary_t2.empty:
-            st.dataframe(summary_t2, use_container_width=True, height=min(400, 80 + len(summary_t2) * 38))
+            st.dataframe(_styler_one_decimal(summary_t2), use_container_width=True, height=min(400, 80 + len(summary_t2) * 38))
             st.caption("(使用店秒) = 每天檔數 × 秒數 × 店數")
         else:
             st.info("尚無公司彙總資料")
@@ -3344,7 +3680,7 @@ elif selected_tab == "📅 表2-秒數明細":
         if details_t2:
             for company_name, detail_df in details_t2.items():
                 with st.expander(f"**{company_name}**", expanded=True):
-                    st.dataframe(detail_df, use_container_width=True, height=min(400, 80 + len(detail_df) * 38))
+                    st.dataframe(_styler_one_decimal(detail_df), use_container_width=True, height=min(400, 80 + len(detail_df) * 38))
         else:
             st.info("尚無依公司明細資料")
         
@@ -3369,7 +3705,7 @@ elif selected_tab == "📅 表2-秒數明細":
         except Exception as e:
             st.caption(f"下載 Excel 時發生錯誤：{e}")
 
-elif selected_tab == "📊 表3-庫存熱力圖":
+elif selected_tab == "📊 表3-每日庫存":
     _render_tab3(role_readonly=(role == "業務"))
 
 elif selected_tab == "📈 總結表":
@@ -3401,6 +3737,17 @@ elif selected_tab == "📈 總結表":
                 if val >= 50:
                     return 'background-color: #6bcf7f'
                 return ''
+
+            def _round_table_one_decimal(df):
+                """總結表頁：所有表格內數字最多取到小數點第一位。"""
+                if df is None or df.empty:
+                    return df
+                out = df.copy()
+                num_cols = out.select_dtypes(include=[np.number]).columns.tolist()
+                if num_cols:
+                    out[num_cols] = out[num_cols].round(1)
+                return out
+
             # 使用率圖例
             st.markdown("#### 🎨 使用率圖例")
             c1, c2, c3 = st.columns(3)
@@ -3411,37 +3758,86 @@ elif selected_tab == "📈 總結表":
             with c3:
                 st.markdown("🔴 **紅**：100%+")
             
-            # 頂部：企頻使用率、新鮮視使用率、家樂福使用率、診所使用率
+            # 上下半年各一個表格（不再分季）；表格不設固定高度，完整延展、不需表格內上下滑動
+            _h1_cols = ['項目', '1月', '2月', '3月', '4月', '5月', '6月']
+            _h2_cols = ['項目', '7月', '8月', '9月', '10月', '11月', '12月']
+            _month_cols_h1 = _h1_cols[1:]
+            _month_cols_h2 = _h2_cols[1:]
+
+            # 頂部：年度使用率（上半年一個表、下半年一個表）
             if annual.get('top_usage_df') is not None and not annual['top_usage_df'].empty:
                 st.markdown("#### 📊 年度使用率（各實體 × 1月~12月）")
-                top_df = annual['top_usage_df'].copy()
-                def _apply_top_style(row):
-                    return [_style_pct(row.get(c)) for c in top_df.columns]
-                styled_top = top_df.style.apply(_apply_top_style, axis=1)
-                st.dataframe(styled_top, use_container_width=True, height=180)
-            
-            # 各實體區塊：2026 企頻、2026 新鮮視、2026 家樂福、2026 診所
+                top_df = _round_table_one_decimal(annual['top_usage_df'].copy())
+                st.caption("**上半年（1月～6月）**")
+                top_h1 = top_df[_h1_cols]
+                st.dataframe(
+                    top_h1.style.format({c: "{:.1f}" for c in _month_cols_h1}).apply(
+                        lambda row: [_style_pct(row.get(c)) if c in _month_cols_h1 else '' for c in top_h1.columns],
+                        axis=1
+                    ),
+                    use_container_width=True,
+                )
+                st.caption("**下半年（7月～12月）**")
+                top_h2 = top_df[_h2_cols]
+                st.dataframe(
+                    top_h2.style.format({c: "{:.1f}" for c in _month_cols_h2}).apply(
+                        lambda row: [_style_pct(row.get(c)) if c in _month_cols_h2 else '' for c in top_h2.columns],
+                        axis=1
+                    ),
+                    use_container_width=True,
+                )
+
+            # 各實體區塊：上下半年各一個表格，表格完整延展
             for ent in ANNUAL_SUMMARY_ENTITY_LABELS:
                 block = annual['entities'].get(ent)
                 if not block:
                     continue
                 st.markdown(f"#### {summary_year} {ent}")
                 st.caption(f"平均每月店秒：{block['avg_monthly_seconds']:,.0f}" if block['avg_monthly_seconds'] else f"{ent} 當月每日可用秒數請於表3 設定後，此處會顯示容量與使用率。")
-                # 秒數用途分列（銷售秒數、交換秒數、贈送秒數、補檔秒數、賀歲秒數、公益秒數）
-                st.dataframe(block['by_type_df'], use_container_width=True, height=220)
-                # 使用秒數、未使用秒數、使用率
-                summary_table = pd.DataFrame([
+                # 秒數用途分列：上半年一個表、下半年一個表（數字最多小數點第一位）
+                by_type = _round_table_one_decimal(block['by_type_df'].copy())
+                if all(c in by_type.columns for c in _h1_cols + _h2_cols):
+                    st.caption("秒數用途分列 — **上半年**")
+                    st.dataframe(by_type[_h1_cols].style.format({c: "{:.1f}" for c in _month_cols_h1}), use_container_width=True)
+                    st.caption("秒數用途分列 — **下半年**")
+                    st.dataframe(by_type[_h2_cols].style.format({c: "{:.1f}" for c in _month_cols_h2}), use_container_width=True)
+                else:
+                    _by_type_month_cols = [c for c in by_type.columns if c != '項目']
+                    st.dataframe(by_type.style.format({c: "{:.1f}" for c in _by_type_month_cols}) if _by_type_month_cols else by_type, use_container_width=True)
+                # 使用／未使用／使用率：上半年一個表、下半年一個表（數字最多小數點第一位）
+                summary_table = _round_table_one_decimal(pd.DataFrame([
                     block['used_row'],
                     block['unused_row'],
                     block['usage_rate_row'],
-                ])
-                def _apply_summary_style(row):
-                    return [_style_pct(row.get(c)) if (row.get('項目') or '').endswith('使用率') and c.endswith('月') else '' for c in summary_table.columns]
-                styled_sum = summary_table.style.apply(_apply_summary_style, axis=1)
-                st.dataframe(styled_sum, use_container_width=True, height=140)
-            
-            # 下載：合併為單一 Excel（多工作表）
+                ]))
+                if all(c in summary_table.columns for c in _h1_cols + _h2_cols):
+                    st.caption("使用／未使用／使用率 — **上半年**")
+                    part_h1 = summary_table[_h1_cols]
+                    st.dataframe(
+                        part_h1.style.format({c: "{:.1f}" for c in _month_cols_h1}).apply(
+                            lambda row: [_style_pct(row.get(c)) if (row.get('項目') or '').endswith('使用率') and c in _month_cols_h1 else '' for c in part_h1.columns],
+                            axis=1
+                        ),
+                        use_container_width=True,
+                    )
+                    st.caption("使用／未使用／使用率 — **下半年**")
+                    part_h2 = summary_table[_h2_cols]
+                    st.dataframe(
+                        part_h2.style.format({c: "{:.1f}" for c in _month_cols_h2}).apply(
+                            lambda row: [_style_pct(row.get(c)) if (row.get('項目') or '').endswith('使用率') and c in _month_cols_h2 else '' for c in part_h2.columns],
+                            axis=1
+                        ),
+                        use_container_width=True,
+                    )
+                else:
+                    def _apply_summary_style(row):
+                        return [_style_pct(row.get(c)) if (row.get('項目') or '').endswith('使用率') and c.endswith('月') else '' for c in summary_table.columns]
+                    _summary_month_cols = [c for c in summary_table.columns if c.endswith('月')]
+                    st.dataframe(summary_table.style.format({c: "{:.1f}" for c in _summary_month_cols}).apply(_apply_summary_style, axis=1), use_container_width=True)
+
+            # 下載：Excel 與 PDF
             st.markdown("#### 📥 下載年度總結")
+            dl_col1, dl_col2 = st.columns(2)
             try:
                 from io import BytesIO
                 buf = BytesIO()
@@ -3454,15 +3850,29 @@ elif selected_tab == "📈 總結表":
                             block['by_type_df'].to_excel(w, sheet_name=f'{ent}_秒數用途', index=False)
                             pd.DataFrame([block['used_row'], block['unused_row'], block['usage_rate_row']]).to_excel(w, sheet_name=f'{ent}_使用未使用率', index=False)
                 buf.seek(0)
-                st.download_button(
-                    label="📥 下載年度使用秒數總表 Excel",
-                    data=buf.getvalue(),
-                    file_name=f"年度使用秒數總表_{summary_year}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="dl_annual_summary"
-                )
+                with dl_col1:
+                    st.download_button(
+                        label="📥 下載年度使用秒數總表 Excel",
+                        data=buf.getvalue(),
+                        file_name=f"年度使用秒數總表_{summary_year}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_annual_summary"
+                    )
             except Exception as e:
-                st.caption(f"下載 Excel 時發生錯誤：{e}")
+                with dl_col1:
+                    st.caption(f"下載 Excel 時發生錯誤：{e}")
+            pdf_bytes = _build_annual_summary_pdf(annual, summary_year)
+            with dl_col2:
+                if pdf_bytes:
+                    st.download_button(
+                        label="📄 匯出 PDF",
+                        data=pdf_bytes,
+                        file_name=f"年度使用秒數總表_{summary_year}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                        mime="application/pdf",
+                        key="dl_annual_summary_pdf"
+                    )
+                else:
+                    st.caption("匯出 PDF 需安裝 reportlab：pip install reportlab")
         else:
             st.warning("📭 尚無每日資料或媒體平台欄位，請先產生模擬資料。")
     else:
@@ -3511,7 +3921,8 @@ elif selected_tab == "📉 總結表圖表":
                 st.markdown("**對應數字表：年度使用率（各實體 × 1月~12月）**")
                 st.caption("🟢 50%+　🟡 70%+　🔴 100%+")
                 top_tbl = annual_viz['top_usage_df'].copy()
-                styled_top = top_tbl.style.apply(lambda row: [_style_pct_viz(row.get(c)) for c in top_tbl.columns], axis=1)
+                _month_cols_viz = [c for c in top_tbl.columns if c != '項目']
+                styled_top = top_tbl.style.format({c: "{:.1f}" for c in _month_cols_viz}).apply(lambda row: [_style_pct_viz(row.get(c)) for c in top_tbl.columns], axis=1)
                 st.dataframe(styled_top, use_container_width=True, height=180)
             else:
                 st.info("尚無各媒體平台使用率資料（請於表3 設定當月每日可用秒數後再檢視）。")
@@ -3551,13 +3962,16 @@ elif selected_tab == "📉 總結表圖表":
                     continue
                 st.markdown(f"**{summary_year_viz} {ent}**")
                 st.caption(f"平均每月店秒：{block['avg_monthly_seconds']:,.0f}" if block['avg_monthly_seconds'] else f"{ent} 當月每日可用秒數請於表3 設定。")
-                st.dataframe(block['by_type_df'], use_container_width=True, height=220)
+                _bt = block['by_type_df']
+                _bt_month_cols = [c for c in _bt.columns if c != '項目']
+                st.dataframe(_bt.style.format({c: "{:.1f}" for c in _bt_month_cols}) if _bt_month_cols else _bt, use_container_width=True, height=220)
                 summary_table = pd.DataFrame([
                     block['used_row'],
                     block['unused_row'],
                     block['usage_rate_row'],
                 ])
-                styled_sum = summary_table.style.apply(
+                _sum_month_cols = [c for c in summary_table.columns if c.endswith('月')]
+                styled_sum = summary_table.style.format({c: "{:.1f}" for c in _sum_month_cols}).apply(
                     lambda row: [_style_pct_viz(row.get(c)) if (row.get('項目') or '').endswith('使用率') and c.endswith('月') else '' for c in summary_table.columns],
                     axis=1
                 )
@@ -3591,10 +4005,205 @@ elif selected_tab == "📉 總結表圖表":
     else:
         st.warning("📭 尚無每日資料，請先產生模擬資料。")
 
+elif selected_tab == "📊 分公司×媒體 每月秒數":
+    st.markdown("### 📊 分公司 × 媒體平台 使用總秒數")
+    st.caption("多種圖表回答不同決策問題：結構、總量、誰用最多、是否失衡、趨勢。")
+    if df_daily.empty or '使用店秒' not in df_daily.columns or '公司' not in df_daily.columns or '媒體平台' not in df_daily.columns:
+        st.warning("📭 尚無每日資料或缺少「公司」「媒體平台」「使用店秒」欄位，請先產生模擬資料。")
+    else:
+        df_v = df_daily.copy()
+        df_v['日期'] = pd.to_datetime(df_v['日期'], errors='coerce')
+        df_v = df_v.dropna(subset=['日期'])
+        df_v['年'] = df_v['日期'].dt.year
+        df_v['月'] = df_v['日期'].dt.month
+        agg = df_v.groupby(['年', '月', '公司', '媒體平台'], dropna=False)['使用店秒'].sum().reset_index()
+        years_avail = sorted(agg['年'].dropna().unique().astype(int).tolist()) if not agg.empty else [datetime.now().year]
+        viz_year = st.number_input("年度", min_value=2020, max_value=2030, value=years_avail[0] if years_avail else datetime.now().year, key="viz_branch_media_year")
+        agg_y = agg[agg['年'] == viz_year]
+        companies_avail = sorted(agg_y['公司'].dropna().unique().tolist()) if not agg_y.empty else []
+        companies_avail = [c for c in companies_avail if c]
+        media_avail = sorted(agg_y['媒體平台'].dropna().unique().tolist()) if not agg_y.empty else []
+        media_avail = [m for m in media_avail if m]
+
+        time_scope = st.radio("時間範圍", options=["全年合計", "指定月份"], horizontal=True, key="viz_branch_scope")
+        if time_scope == "指定月份":
+            month_choice = st.selectbox("選擇月份", options=list(range(1, 13)), format_func=lambda x: f"{x}月", key="viz_branch_month")
+            agg_scope = agg_y[agg_y['月'] == month_choice]
+            scope_label = f"{viz_year} 年 {month_choice} 月"
+        else:
+            agg_scope = agg_y
+            scope_label = f"{viz_year} 年 全年合計"
+
+        if not agg_scope.empty and companies_avail:
+            pivot_t = agg_scope.pivot_table(index='公司', columns='媒體平台', values='使用店秒', aggfunc='sum').reindex(companies_avail).fillna(0)
+            pivot_t = pivot_t.reindex(columns=media_avail, fill_value=0) if media_avail else pivot_t
+            total_scope = pivot_t.sum().sum()
+        else:
+            pivot_t = pd.DataFrame()
+            total_scope = 0
+            scope_label = f"{viz_year} 年"
+
+        if not pivot_t.empty and total_scope > 0:
+            st.markdown("---")
+            st.markdown("#### ① 各分公司 × 媒體平台 — 總秒數堆疊圖")
+            st.caption("每根長條為一分公司，各段為各媒體使用總秒數（堆疊為實際秒數，非占比）。")
+            st.bar_chart(pivot_t)
+            st.dataframe(_styler_one_decimal(pivot_t.reset_index()), use_container_width=True, height=min(220, 80 + len(pivot_t) * 36))
+
+            st.markdown("---")
+            st.markdown("#### ② 分公司 × 平台 使用秒數（先分公司、再分平台，同平台同色）")
+            st.caption("X 軸依序為 分公司-平台（東吳-企頻、東吳-新鮮視…）；同一平台顏色一致，方便比較不同分公司。")
+            # 列 = 分公司-平台（先分公司再分平台），欄 = 平台（僅該格有值，其餘 0 → 同平台同色）
+            bar_labels = [f"{co}-{mp}" for co in companies_avail for mp in media_avail]
+            df_bars = pd.DataFrame(0.0, index=bar_labels, columns=media_avail)
+            for co in companies_avail:
+                for mp in media_avail:
+                    df_bars.loc[f"{co}-{mp}", mp] = float(pivot_t.loc[co, mp]) if co in pivot_t.index and mp in pivot_t.columns else 0.0
+            st.bar_chart(df_bars)
+            st.dataframe(_styler_one_decimal(pivot_t.reset_index()), use_container_width=True, height=min(220, 80 + len(pivot_t) * 36))
+
+            st.markdown("---")
+            st.markdown("#### ③ 某媒體「誰用最多」— 媒體 × 分公司矩陣表 / heatmap")
+            st.caption("列＝媒體平台、欄＝分公司；顏色越深表示該媒體在該分公司用量越高（可看出單一媒體誰用最多）。")
+            pivot_media_company = pivot_t.T.astype(float)
+            # 手動依列做漸層上色（不依賴 matplotlib）
+            def _heatmap_row_style(row):
+                mn, mx = row.min(), row.max()
+                if mx <= mn or pd.isna(mx):
+                    return [""] * len(row)
+                out = []
+                for v in row:
+                    if not isinstance(v, (int, float)) or pd.isna(v) or v <= 0:
+                        out.append("")
+                        continue
+                    r = (v - mn) / (mx - mn)
+                    # 淺黃 -> 深紅
+                    R = 255
+                    G = int(255 - 138 * r)
+                    B = int(240 - 133 * r)
+                    out.append(f"background-color: rgb({R},{max(0,G)},{max(0,B)})")
+                return out
+            heatmap_styled = pivot_media_company.style.apply(_heatmap_row_style, axis=1).format("{:.0f}")
+            st.dataframe(heatmap_styled, use_container_width=True, height=min(320, 100 + len(pivot_media_company) * 38))
+
+            st.markdown("---")
+            st.markdown("#### ④ 資源是否失衡 — 占比 + 警示色")
+            st.caption("各分公司內各媒體占比；🔴 單一媒體佔該分公司 ≥50% 可能過度集中、🟡 30–50%、🟢 較分散。")
+            row_sum_ = pivot_t.sum(axis=1)
+            pct_t = pivot_t.div(row_sum_.replace(0, np.nan), axis=0).fillna(0) * 100
+
+            def _cell_balance_style(v):
+                if not isinstance(v, (int, float)) or pd.isna(v):
+                    return ""
+                if v >= 50:
+                    return "background-color: #ff6b6b; color: white"
+                if v >= 30:
+                    return "background-color: #ffd93d"
+                if v > 0:
+                    return "background-color: #90EE90"
+                return ""
+
+            pct_display = pct_t.reset_index()
+            def _balance_color(row):
+                return ["" if c == "公司" else _cell_balance_style(row.get(c)) for c in pct_display.columns]
+            st.dataframe(pct_display.style.format({c: "{:.1f}" for c in media_avail if c in pct_display.columns}).apply(_balance_color, axis=1), use_container_width=True, height=min(280, 80 + len(pct_display) * 36))
+
+            st.markdown("---")
+            st.markdown("#### ⑤ 年度 vs 月份趨勢 — 小 multiples 折線圖")
+            st.caption("各分公司在 1～12 月、各媒體使用秒數的變化（每區塊一分公司）。")
+            if not agg_y.empty and companies_avail and media_avail:
+                n_cols = min(3, len(companies_avail))
+                for i in range(0, len(companies_avail), n_cols):
+                    cols = st.columns(n_cols)
+                    for j in range(n_cols):
+                        idx = i + j
+                        if idx >= len(companies_avail):
+                            break
+                        co = companies_avail[idx]
+                        with cols[j]:
+                            agg_co = agg_y[agg_y['公司'] == co].pivot_table(index='月', columns='媒體平台', values='使用店秒', aggfunc='sum').reindex(range(1, 13)).fillna(0)
+                            agg_co.index = [f"{int(m)}月" for m in agg_co.index]
+                            if not agg_co.empty and agg_co.sum().sum() > 0:
+                                st.caption(f"**{co}**")
+                                st.line_chart(agg_co)
+                            else:
+                                st.caption(f"**{co}**（無資料）")
+
+            st.markdown("---")
+            st.markdown("#### ⑥ 全年趨勢合併圖（所有分公司-平台 一次看）")
+            st.caption("圖⑤ 的折線合併成一張圖，每條線為一個「分公司-平台」；顏色採易辨識配置。")
+            if not agg_y.empty and companies_avail and media_avail:
+                series_order = [f"{co}-{mp}" for co in companies_avail for mp in media_avail]
+                long_rows = []
+                for _, r in agg_y.iterrows():
+                    key = f"{r['公司']}-{r['媒體平台']}"
+                    if key in series_order:
+                        long_rows.append({"月": f"{int(r['月'])}月", "分公司-平台": key, "使用秒數": float(r["使用店秒"])})
+                if long_rows:
+                    df_lines = pd.DataFrame(long_rows)
+                    pivot_lines = df_lines.pivot_table(index="月", columns="分公司-平台", values="使用秒數", aggfunc="sum").reindex(
+                        [f"{m}月" for m in range(1, 13)], fill_value=0
+                    ).fillna(0)
+                    for c in series_order:
+                        if c not in pivot_lines.columns:
+                            pivot_lines[c] = 0
+                    pivot_lines = pivot_lines[[c for c in series_order if c in pivot_lines.columns]]
+                    if not pivot_lines.empty and pivot_lines.sum().sum() > 0:
+                        try:
+                            import altair as alt
+                            import colorsys
+                            # 同一分公司用同一色系（同 hue）、不同平台用深淺區分（不同 lightness）
+                            palette = []
+                            n_c, n_m = len(companies_avail), len(media_avail)
+                            for i in range(n_c):
+                                hue = (i / max(1, n_c)) * 0.82
+                                for j in range(n_m):
+                                    lightness = 0.38 + 0.4 * (j / max(1, n_m))
+                                    r, g, b = colorsys.hls_to_rgb(hue, lightness, 0.75)
+                                    palette.append("#{:02x}{:02x}{:02x}".format(int(r * 255), int(g * 255), int(b * 255)))
+                            source = pivot_lines.reset_index().melt(id_vars=["月"], var_name="分公司-平台", value_name="使用秒數")
+                            month_order = [f"{m}月" for m in range(1, 13)]
+                            source["月序"] = source["月"].map(lambda x: month_order.index(x) if x in month_order else 0)
+                            lines = (
+                                alt.Chart(source)
+                                .mark_line(strokeWidth=2.5, point=alt.OverlayMarkDef(size=50, filled=True))
+                                .encode(
+                                    x=alt.X("月:O", title="月份", sort=month_order),
+                                    y=alt.Y("使用秒數:Q", title="使用秒數"),
+                                    color=alt.Color("分公司-平台:N", legend=alt.Legend(title="分公司-平台"), scale=alt.Scale(range=palette)),
+                                    order="月序"
+                                )
+                                .properties(width=700, height=400)
+                            )
+                            st.altair_chart(lines, use_container_width=True)
+                        except ImportError:
+                            st.line_chart(pivot_lines)
+                            st.caption("（安裝 altair 可顯示自訂易辨識顏色：pip install altair）")
+                    else:
+                        st.caption("該年度無使用資料")
+                else:
+                    st.caption("該年度無使用資料")
+            else:
+                st.caption("尚無分公司或媒體資料。")
+
+        else:
+            st.caption("尚無分公司或媒體資料，或該時間範圍無使用資料，請先產生模擬資料。")
+
 elif selected_tab == "📋 媒體秒數與採購":
     st.markdown("### 📋 媒體秒數與採購")
     st.caption("輸入各媒體平台「一年 12 個月」的購買秒數與購買價格；儲存後會同步更新表3 的當月每日可用秒數，並供 ROI 實驗分頁換算成本。")
     purchase_year = st.number_input("年度", min_value=2020, max_value=2030, value=datetime.now().year, key="purchase_year")
+    if st.button("🎲 產生模擬採購資料（測試用）", type="secondary", key="gen_mock_purchase", help="為上述年度、所有媒體產生 1～12 月合理模擬數據，方便測試表3 與 ROI 分頁"):
+        with st.spinner("正在產生模擬採購資料..."):
+            ok, msg = generate_mock_platform_purchase_for_year(purchase_year)
+            if ok:
+                to_del = [k for k in st.session_state if str(k).startswith("purchase_sec_") or str(k).startswith("purchase_price_")]
+                for k in to_del:
+                    del st.session_state[k]
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(f"產生失敗：{msg}")
     existing = load_platform_monthly_purchase_all_media_for_year(purchase_year)
     import calendar
     for mp in MEDIA_PLATFORM_OPTIONS:
@@ -3718,11 +4327,11 @@ elif selected_tab == "🧪 實驗分頁":
         # === 系統語句生成 ===
         if metrics["emergency_unused_seconds"] > 0 and rem > 0 and rem <= 10:
             st.info(f"💬 **本月進入關鍵救援期，未來 {rem} 天為唯一補救窗口。**")
-        st.caption("TWWI（時間加權浪費指數）= " + str(round(metrics["twwi"], 0)))
+        st.caption("TWWI（時間加權浪費指數）= " + str(round(metrics["twwi"], 1)))
 
         # 可選：日粒度表
         with st.expander("📋 日粒度事實表（daily_inventory）", expanded=False):
-            st.dataframe(daily_inv, use_container_width=True, height=400)
+            st.dataframe(_styler_one_decimal(daily_inv), use_container_width=True, height=400)
     else:
         st.warning("📭 尚無每日資料，請先產生模擬資料。")
 
@@ -3736,9 +4345,22 @@ elif selected_tab == "📊 ROI 實驗":
 2. ROI 衡量的是「**避免浪費的營運價值**」，不是廣告成效
 3. 只有「原本會浪費的秒數被消化」才算 ROI 貢獻
 4. 本頁為實驗用途；**每秒成本 = 該月購買價格 ÷ 該月購買秒數**（來自媒體秒數與採購分頁）
+5. **同一筆合約若有多媒體平台**：實收金額依「各媒體使用秒數佔該合約總秒數比例」拆分到各媒體，再算各媒體 ROI（可勾選下方「使用表1/訂單資料計算實收」套用）
         """)
     roi_year = st.number_input("ROI 參考年度（用於取採購成本）", min_value=2020, max_value=2030, value=datetime.now().year, key="roi_year")
     roi_month = st.number_input("ROI 參考月份（用於取採購成本）", min_value=1, max_value=12, value=datetime.now().month, key="roi_month")
+    use_table1_revenue = st.checkbox(
+        "使用表1/訂單資料計算實收（同一合約多媒體時依各媒體使用秒數比例拆分到各媒體）",
+        value=False,
+        key="roi_use_table1_revenue",
+    )
+    revenue_per_media = {}
+    if use_table1_revenue:
+        revenue_per_media = get_revenue_per_media_allocated_by_seconds()
+        if revenue_per_media:
+            st.caption(f"已從訂單＋檔次段依秒數比例分配實收，共 {len(revenue_per_media)} 個媒體有資料。")
+        else:
+            st.caption("尚無訂單或檔次段資料，實收將以模擬資料或 WAV 計算。")
     df_roi = _build_roi_mock_daily_inventory()
     would_be_wasted = get_would_be_wasted_seconds(df_roi)
     total_rescuable = sum(would_be_wasted.values())
@@ -3762,7 +4384,7 @@ elif selected_tab == "📊 ROI 實驗":
             row = get_platform_monthly_purchase(mp, roi_year, roi_month)
             if row is not None and row[0] and row[0] > 0:
                 cost = row[1] / row[0]
-                st.caption(f"**{mp}**：採購換算 = {row[1]:,.0f} 元 ÷ {row[0]:,} 秒 ≈ **{cost:.2f} 元/秒**")
+                st.caption(f"**{mp}**：採購換算 = {row[1]:,.0f} 元 ÷ {row[0]:,} 秒 ≈ **{cost:.1f} 元/秒**")
             else:
                 val = st.number_input(f"{mp} 每秒成本（元，補填）", min_value=0.1, max_value=20.0, value=float(st.session_state["roi_media_cost"].get(mp, 2.0)), step=0.1, key=f"roi_cost_{mp}")
                 st.session_state["roi_media_cost"][mp] = val
@@ -3784,33 +4406,35 @@ elif selected_tab == "📊 ROI 實驗":
         )
         invest_sliders[mp] = invest
         cost_per_sec = get_cost_for_media(mp)
-        res = calculate_roi(mp, invest, cost_per_sec, df_roi)
+        rev_override = revenue_per_media.get(mp) if use_table1_revenue and revenue_per_media else None
+        res = calculate_roi(mp, invest, cost_per_sec, df_roi, revenue_override=rev_override)
         roi_rows.append({
             "媒體": mp,
             "使用成本（元/秒）": cost_per_sec,
             "投資成本（元）": round(res["investment_cost"], 0),
+            "實收金額（元）": res["revenue"],
             "吸收浪費秒數": res["absorbed_waste_seconds"],
-            "WAR": round(res["war"], 2),
-            "ROI": round(res["roi"], 2),
+            "WAR": round(res["war"], 1),
+            "ROI（投報率）": round(res["roi"], 1),
         })
     roi_df = pd.DataFrame(roi_rows)
-    st.dataframe(roi_df, use_container_width=True, height=180)
+    st.dataframe(_styler_one_decimal(roi_df), use_container_width=True, height=180)
 
     # 區塊 D：ROI 視覺化（Bar chart）
     st.markdown("#### 📊 ROI 視覺化")
-    st.bar_chart(roi_df.set_index("媒體")["ROI"])
+    st.bar_chart(roi_df.set_index("媒體")["ROI（投報率）"])
 
     # 區塊 E：系統建議（rule-based，依 ROI 排序）
     st.markdown("#### 🚦 系統建議")
-    sorted_rows = sorted(roi_rows, key=lambda x: x["ROI"], reverse=True)
+    sorted_rows = sorted(roi_rows, key=lambda x: x["ROI（投報率）"], reverse=True)
     for r in sorted_rows:
-        roi_val = r["ROI"]
+        roi_val = r["ROI（投報率）"]
         if roi_val >= 2.0:
             rec = "優先投資"
         elif roi_val >= 1.0:
             rec = "可接受"
         else:
             rec = "不建議"
-        st.markdown(f"- **{r['媒體']}**（ROI = {roi_val}）→ **{rec}**")
+        st.markdown(f"- **{r['媒體']}**（ROI = {round(roi_val, 1)}）→ **{rec}**")
 
 # （檔次稽核、檔次拆解表 已移除）
