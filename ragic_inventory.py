@@ -320,6 +320,81 @@ def generate_mock_platform_purchase_for_year(year):
     except Exception as e:
         return False, str(e)
 
+def generate_mock_platform_purchase_for_year_with_capacity_check(year):
+    """
+    產生某年度、各媒體 1～12 月的模擬採購資料，但確保採購秒數 >= 實際使用秒數，
+    避免覆蓋容量設定後導致使用率破千。
+    回傳 (success: bool, message: str)
+    """
+    import calendar
+    try:
+        # 先計算實際使用秒數
+        conn = get_db_connection()
+        df_seg = pd.read_sql("SELECT * FROM ad_flight_segments WHERE media_platform IS NOT NULL", conn)
+        conn.close()
+        if not df_seg.empty:
+            df_daily = explode_segments_to_daily(df_seg)
+            if not df_daily.empty and '媒體平台' in df_daily.columns and '使用店秒' in df_daily.columns and '日期' in df_daily.columns:
+                df_daily['日期'] = pd.to_datetime(df_daily['日期'], errors='coerce')
+                df_daily = df_daily.dropna(subset=['日期'])
+                df_daily['年'] = df_daily['日期'].dt.year
+                df_daily['月'] = df_daily['日期'].dt.month
+                df_y = df_daily[df_daily['年'] == year]
+                if not df_y.empty:
+                    # 計算每個媒體平台每個月的實際使用秒數
+                    usage_by_media_month = df_y.groupby(['媒體平台', '月'])['使用店秒'].sum().reset_index()
+                    usage_dict = {}
+                    for _, row in usage_by_media_month.iterrows():
+                        mp = row['媒體平台']
+                        month = int(row['月'])
+                        used_sec = float(row['使用店秒'] or 0)
+                        if mp not in usage_dict:
+                            usage_dict[mp] = {}
+                        usage_dict[mp][month] = used_sec
+        else:
+            usage_dict = {}
+        
+        # 各媒體基準：月購買秒數（店秒）、約略單價（元/秒）
+        base_per_media = {
+            '全家廣播(企頻)': (1_600_000, 2.0),
+            '全家新鮮視': (1_300_000, 2.2),
+            '家樂福超市': (900_000, 2.4),
+            '家樂福量販店': (700_000, 2.1),
+        }
+        
+        for mp in MEDIA_PLATFORM_OPTIONS:
+            base_sec, base_price_per_sec = base_per_media.get(mp, (1_000_000, 2.0))
+            for m in range(1, 13):
+                # 計算基礎採購秒數
+                var = 0.92 + (hash((year, mp, m)) % 17) / 100.0
+                sec = int(base_sec * var)
+                sec = max(100_000, min(sec, 5_000_000))
+                
+                # 確保採購秒數 >= 實際使用秒數（至少是使用秒數的 1.2 倍，確保使用率不超過 120%）
+                if mp in usage_dict and m in usage_dict[mp]:
+                    used_sec = usage_dict[mp][m]
+                    min_sec = int(used_sec * 1.2)  # 至少是使用秒數的 1.2 倍
+                    sec = max(sec, min_sec)
+                
+                price_per_sec = base_price_per_sec * (0.95 + (hash((year, mp, m + 10)) % 11) / 100.0)
+                price_per_sec = max(0.8, min(price_per_sec, 4.0))
+                price = int(sec * price_per_sec)
+                price = max(50_000, min(price, 15_000_000))
+                
+                # 只寫入採購資料，不覆蓋容量設定（容量已經根據使用率設定好了）
+                conn = get_db_connection()
+                c = conn.cursor()
+                c.execute('''
+                    INSERT OR REPLACE INTO platform_monthly_purchase (media_platform, year, month, purchased_seconds, purchase_price)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (mp, int(year), int(m), int(sec), float(price)))
+                conn.commit()
+                conn.close()
+        
+        return True, f"已產生 {len(MEDIA_PLATFORM_OPTIONS)} 個媒體、{year} 年 1～12 月模擬採購資料（採購秒數已確保 >= 實際使用秒數）"
+    except Exception as e:
+        return False, f"產生採購資料失敗：{e}"
+
 def load_platform_settings():
     """從資料庫載入平台設定（優先使用資料庫中的設定）"""
     conn = get_db_connection()
@@ -502,6 +577,57 @@ def _styler_one_decimal(df):
     if not num_cols:
         return df.style
     return df.style.format({c: "{:.1f}" for c in num_cols})
+
+
+def _display_monthly_table_split(df, month_cols, style_func=None, height=None, key_prefix=""):
+    """
+    將包含 12 個月欄位的表格拆分成上下半年兩個表格顯示，避免左右滑動。
+    將 12 個月分成 2 組：上半年（1-6月）、下半年（7-12月），垂直排列顯示。
+    
+    參數:
+        df: DataFrame，必須包含 month_cols 中的欄位
+        month_cols: 月份欄位列表，例如 ['1月', '2月', ..., '12月']
+        style_func: 可選的樣式函數，接受 DataFrame 並回傳 Styler
+        height: 可選的表格高度
+        key_prefix: 用於生成唯一 key 的前綴
+    """
+    if df.empty or not month_cols:
+        return
+    
+    # 將 12 個月分成 2 組：上半年和下半年
+    groups = [
+        (month_cols[0:6], "上半年（1月～6月）"),   # 1-6月
+        (month_cols[6:12], "下半年（7月～12月）"),  # 7-12月
+    ]
+    
+    # 取得非月份欄位（例如「項目」欄位）
+    non_month_cols = [c for c in df.columns if c not in month_cols]
+    
+    # 垂直排列顯示兩個表格
+    for idx, (group_months, label) in enumerate(groups):
+        # 選取該組的欄位
+        display_cols = non_month_cols + group_months
+        df_subset = df[[c for c in display_cols if c in df.columns]].copy()
+        
+        if df_subset.empty:
+            continue
+        
+        # 顯示標題
+        st.markdown(f"**{label}**")
+        
+        # 套用樣式
+        if style_func:
+            styled_df = style_func(df_subset)
+        else:
+            styled_df = df_subset.style
+        
+        # 顯示表格（一個一列，垂直排列）
+        st.dataframe(
+            styled_df,
+            use_container_width=True,
+            height=height,
+            key=f"{key_prefix}_split_{idx}"
+        )
 
 
 def read_cue_excel(file_content, max_rows=100):
@@ -1363,6 +1489,50 @@ def generate_mock_orders_2026(n=200):
             break
     return orders
 
+def generate_mock_capacity_for_year(year=2026, target_usage_min=50, target_usage_max=120):
+    """
+    根據已產生的檔次段，計算每個媒體平台每個月的使用秒數，然後設定容量使使用率控制在 target_usage_min ~ target_usage_max %。
+    回傳 (success: bool, message: str)
+    """
+    try:
+        import calendar
+        # 從 DB 讀取 segments 並展開為每日資料
+        conn = get_db_connection()
+        df_seg = pd.read_sql("SELECT * FROM ad_flight_segments WHERE media_platform IS NOT NULL", conn)
+        conn.close()
+        if df_seg.empty:
+            return False, "尚無檔次段資料，請先產生模擬訂單"
+        df_daily = explode_segments_to_daily(df_seg)
+        if df_daily.empty or '媒體平台' not in df_daily.columns or '使用店秒' not in df_daily.columns or '日期' not in df_daily.columns:
+            return False, "無法從檔次段展開每日資料"
+        df_daily['日期'] = pd.to_datetime(df_daily['日期'], errors='coerce')
+        df_daily = df_daily.dropna(subset=['日期'])
+        df_daily['年'] = df_daily['日期'].dt.year
+        df_daily['月'] = df_daily['日期'].dt.month
+        df_y = df_daily[df_daily['年'] == year]
+        if df_y.empty:
+            return False, f"{year} 年尚無每日資料"
+        # 計算每個媒體平台、每個月的使用秒數總和
+        usage_by_media_month = df_y.groupby(['媒體平台', '月'])['使用店秒'].sum().reset_index()
+        # 設定容量：目標使用率 50-120%，容量 = 使用秒數 / 目標使用率
+        capacity_set = set()
+        for _, row in usage_by_media_month.iterrows():
+            mp = row['媒體平台']
+            month = int(row['月'])
+            used_sec = float(row['使用店秒'] or 0)
+            if used_sec <= 0 or pd.isna(mp):
+                continue
+            target_rate = random.uniform(target_usage_min / 100, target_usage_max / 100)
+            monthly_cap = used_sec / target_rate
+            ndays = calendar.monthrange(year, month)[1]
+            daily_cap = max(1, int(monthly_cap / ndays)) if ndays > 0 else max(1, int(monthly_cap / 30))
+            set_platform_monthly_capacity(mp, year, month, daily_cap)
+            capacity_set.add((mp, month))
+        return True, f"已設定 {len(capacity_set)} 筆容量（{year} 年，使用率控制在 {target_usage_min}%-{target_usage_max}%）"
+    except Exception as e:
+        return False, f"產生容量設定失敗：{e}"
+
+
 def load_mock_data_to_db(n=200):
     """
     產生 n 筆 2026 模擬資料並寫入 orders，同時建立 ad_flight_segments。
@@ -1399,6 +1569,27 @@ def load_mock_data_to_db(n=200):
         conn.rollback()
         conn.close()
         return False, str(e)
+
+
+def load_mock_data_with_capacity_to_db(n=200, year=2026):
+    """
+    產生 n 筆模擬資料並寫入 orders，同時產生模擬容量設定和採購資料，使使用率控制在 0-120%。
+    回傳 (success: bool, message: str)
+    """
+    init_db()
+    # 先產生訂單和檔次段
+    success1, msg1 = load_mock_data_to_db(n=n)
+    if not success1:
+        return False, f"產生訂單失敗：{msg1}"
+    # 再產生容量設定（根據實際使用秒數，使使用率在 50-120%）
+    success2, msg2 = generate_mock_capacity_for_year(year=year, target_usage_min=50, target_usage_max=120)
+    if not success2:
+        return False, f"產生容量設定失敗：{msg2}"
+    # 產生模擬採購資料，但採購秒數要 >= 實際使用秒數，避免覆蓋容量後導致使用率破千
+    success3, msg3 = generate_mock_platform_purchase_for_year_with_capacity_check(year)
+    if not success3:
+        return False, f"產生採購資料失敗：{msg3}"
+    return True, f"{msg1}；{msg2}；{msg3}"
 
 
 def _extract_google_sheet_id(url_or_id):
@@ -2484,6 +2675,759 @@ def build_annual_seconds_summary(df_daily, year, monthly_capacity_loader=None):
     return {'top_usage_df': top_usage_df, 'entities': entities_out}
 
 
+def _build_visualization_summary_excel(annual_viz, summary_year):
+    """
+    將總結表視覺化分頁產出為 Excel 二進位內容。
+    包含：① 各媒體平台使用率 ② 各秒數類型使用比例，以及對應的總結表數字。
+    包含完整的圖表（轉換為圖片插入Excel）。
+    回傳 bytes，若失敗回傳 None。
+    """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.drawing.image import Image as ExcelImage
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+        import altair as alt
+        try:
+            import vl_convert as vlc
+        except ImportError:
+            vlc = None
+    except ImportError:
+        return None
+    
+    buf = io.BytesIO()
+    try:
+        wb = Workbook()
+        wb.remove(wb.active)  # 移除預設工作表
+        
+        month_cols = [f"{m}月" for m in range(1, 13)]
+        
+        # 輔助函數：將 Altair 圖表轉換為圖片
+        def _chart_to_image(chart, scale=2):
+            """將 Altair 圖表轉換為 PNG bytes"""
+            if vlc is None:
+                return None
+            try:
+                png_data = vlc.vegalite_to_png(chart.to_json(), scale=scale)
+                return io.BytesIO(png_data)
+            except Exception:
+                return None
+        
+        # 輔助函數：設置單元格樣式
+        def _style_cell(cell, is_header=False, is_percentage=False, value=None):
+            """設置單元格樣式和顏色"""
+            cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            cell.border = Border(
+                left=Side(style='thin'),
+                right=Side(style='thin'),
+                top=Side(style='thin'),
+                bottom=Side(style='thin')
+            )
+            
+            if is_header:
+                cell.font = Font(bold=True, size=10)
+                cell.fill = PatternFill(start_color='D3D3D3', end_color='D3D3D3', fill_type='solid')
+            else:
+                cell.font = Font(size=9)
+                # 根據數值設置顏色
+                if is_percentage and value is not None:
+                    try:
+                        val_float = float(str(value).replace('%', '').replace(',', ''))
+                        if val_float >= 100:
+                            cell.fill = PatternFill(start_color='FF6B6B', end_color='FF6B6B', fill_type='solid')
+                            cell.font = Font(size=9, color='FFFFFF', bold=True)
+                        elif val_float >= 70:
+                            cell.fill = PatternFill(start_color='FFD93D', end_color='FFD93D', fill_type='solid')
+                            cell.font = Font(size=9, bold=True)
+                        elif val_float >= 50:
+                            cell.fill = PatternFill(start_color='6BCF7F', end_color='6BCF7F', fill_type='solid')
+                            cell.font = Font(size=9)
+                    except (ValueError, TypeError):
+                        pass
+        
+        # 輔助函數：添加數據表格到工作表
+        def _add_dataframe_to_sheet(ws, df, start_row=1, start_col=1, apply_color=False):
+            """將DataFrame添加到工作表"""
+            # 添加標題行
+            for col_idx, col_name in enumerate(df.columns, start=start_col):
+                cell = ws.cell(row=start_row, column=col_idx)
+                cell.value = str(col_name)
+                _style_cell(cell, is_header=True)
+            
+            # 添加數據行
+            for row_idx, (idx, row) in enumerate(df.iterrows(), start=start_row + 1):
+                for col_idx, col_name in enumerate(df.columns, start=start_col):
+                    cell = ws.cell(row=row_idx, column=col_idx)
+                    val = row[col_name]
+                    cell.value = val
+                    is_percentage = '使用率' in str(col_name) or '使用率' in str(idx) or (isinstance(val, str) and '%' in val)
+                    _style_cell(cell, is_header=False, is_percentage=is_percentage if apply_color else False, value=val)
+            
+            # 自動調整列寬
+            for col_idx, col_name in enumerate(df.columns, start=start_col):
+                col_letter = get_column_letter(col_idx)
+                max_length = max(len(str(col_name)), max([len(str(row[col_name])) for _, row in df.iterrows()], default=0))
+                ws.column_dimensions[col_letter].width = min(max_length + 2, 15)
+        
+        # ① 各媒體平台使用率
+        ws1 = wb.create_sheet("①媒體平台使用率")
+        ws1['A1'] = f"① 各媒體平台使用率隨時間變化趨勢 - {summary_year}"
+        ws1['A1'].font = Font(bold=True, size=14)
+        ws1.merge_cells('A1:N1')
+        
+        if annual_viz.get('top_usage_df') is not None and not annual_viz['top_usage_df'].empty:
+            top_df = annual_viz['top_usage_df'].copy()
+            top_df['媒體平台'] = top_df['項目'].str.replace("使用率", "", regex=False)
+            chart_df_platform = top_df.set_index("媒體平台")[month_cols].T
+            chart_df_platform.index.name = "月份"
+            
+            # 創建折線圖
+            try:
+                chart_df_platform_melted = chart_df_platform.reset_index().melt(id_vars='月份', var_name='媒體平台', value_name='使用率')
+                chart_df_platform_melted['使用率標籤'] = chart_df_platform_melted['使用率'].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "")
+                
+                line_chart = alt.Chart(chart_df_platform_melted).mark_line(point=True).encode(
+                    x=alt.X('月份:O', title='月份'),
+                    y=alt.Y('使用率:Q', title='使用率 (%)', axis=alt.Axis(format='.1f')),
+                    color=alt.Color('媒體平台:N', title='媒體平台'),
+                    tooltip=['月份', '媒體平台', alt.Tooltip('使用率:Q', format='.1f', title='使用率 (%)')]
+                ).properties(width=700, height=400)
+                
+                text_chart = alt.Chart(chart_df_platform_melted).mark_text(
+                    align='center',
+                    baseline='bottom',
+                    dy=-8,
+                    fontSize=10
+                ).encode(
+                    x=alt.X('月份:O', title='月份'),
+                    y=alt.Y('使用率:Q', title='使用率 (%)', axis=alt.Axis(format='.1f')),
+                    text=alt.Text('使用率標籤:N'),
+                    color=alt.Color('媒體平台:N', legend=None)
+                )
+                
+                chart_platform = (line_chart + text_chart).properties(width=700, height=400)
+                img_data = _chart_to_image(chart_platform)
+                if img_data:
+                    img = ExcelImage(img_data)
+                    img.width = 700
+                    img.height = 400
+                    ws1.add_image(img, 'A3')
+            except Exception:
+                pass
+            
+            # 添加表格（從第25行開始，給圖表留空間）
+            _add_dataframe_to_sheet(ws1, top_df, start_row=25, apply_color=True)
+        
+        # ② 各秒數類型使用比例
+        ws2 = wb.create_sheet("②秒數類型比例")
+        ws2['A1'] = f"② 各秒數類型使用比例隨時間變化趨勢 - {summary_year}"
+        ws2['A1'].font = Font(bold=True, size=14)
+        ws2.merge_cells('A1:N1')
+        
+        by_type_agg = None
+        for ent in ANNUAL_SUMMARY_ENTITY_LABELS:
+            block = annual_viz.get('entities', {}).get(ent)
+            if not block or block.get('by_type_df') is None:
+                continue
+            bt = block['by_type_df'].set_index("項目")[month_cols]
+            if by_type_agg is None:
+                by_type_agg = bt.copy()
+            else:
+                by_type_agg = by_type_agg + bt
+        
+        if by_type_agg is not None and not by_type_agg.empty:
+            # 計算百分比
+            monthly_total = by_type_agg.sum(axis=0)
+            proportion = by_type_agg.copy()
+            for c in month_cols:
+                if monthly_total.get(c, 0) and monthly_total[c] > 0:
+                    proportion[c] = (by_type_agg[c] / monthly_total[c] * 100)
+                else:
+                    proportion[c] = 0
+            
+            # 確保每個月份的比例加總為100%
+            for col in proportion.columns:
+                monthly_sum = proportion[col].sum()
+                if monthly_sum > 0 and abs(monthly_sum - 100) > 0.01:
+                    proportion[col] = proportion[col] / monthly_sum * 100
+            
+            chart_df_type = proportion.T
+            chart_df_type.index.name = "月份"
+            
+            # 創建堆疊長條圖
+            try:
+                chart_df_type_melted = chart_df_type.reset_index().melt(id_vars='月份', var_name='秒數類型', value_name='比例')
+                chart_df_type_melted['比例'] = pd.to_numeric(chart_df_type_melted['比例'], errors='coerce').fillna(0)
+                chart_df_type_melted['比例'] = chart_df_type_melted['比例'].clip(lower=0)
+                
+                # 確保每個月份都有所有秒數類型的數據
+                all_types = chart_df_type_melted['秒數類型'].unique()
+                all_months = chart_df_type_melted['月份'].unique()
+                complete_data = []
+                for month in all_months:
+                    for sec_type in all_types:
+                        existing = chart_df_type_melted[(chart_df_type_melted['月份'] == month) & 
+                                                       (chart_df_type_melted['秒數類型'] == sec_type)]
+                        if existing.empty:
+                            complete_data.append({'月份': month, '秒數類型': sec_type, '比例': 0})
+                        else:
+                            complete_data.append(existing.iloc[0].to_dict())
+                chart_df_type_melted = pd.DataFrame(complete_data)
+                
+                chart_df_type_melted['比例'] = chart_df_type_melted.groupby('月份')['比例'].transform(
+                    lambda x: (x / x.sum() * 100) if x.sum() > 0 else 0
+                )
+                
+                chart_df_type_melted['比例標籤'] = chart_df_type_melted.apply(
+                    lambda row: f"{row['比例']:.1f}%" if pd.notna(row['比例']) and row['比例'] > 2 else "", 
+                    axis=1
+                )
+                
+                chart_df_type_melted_sorted = chart_df_type_melted.sort_values(['月份', '秒數類型']).copy()
+                chart_df_type_melted_sorted = chart_df_type_melted_sorted.reset_index(drop=True)
+                chart_df_type_melted_sorted['累積起始'] = chart_df_type_melted_sorted.groupby('月份')['比例'].transform(
+                    lambda x: x.shift(1).fillna(0).cumsum()
+                )
+                chart_df_type_melted_sorted['段中間位置'] = (
+                    chart_df_type_melted_sorted['累積起始'] + chart_df_type_melted_sorted['比例'] / 2
+                )
+                
+                bar_chart = alt.Chart(chart_df_type_melted_sorted).mark_bar().encode(
+                    x=alt.X('月份:O', title='月份'),
+                    y=alt.Y('比例:Q', title='比例 (%)', 
+                           axis=alt.Axis(format='.1f'),
+                           stack=True,
+                           scale=alt.Scale(domain=[0, 100])),
+                    color=alt.Color('秒數類型:N', title='秒數類型', 
+                                  sort=alt.SortField('秒數類型', order='ascending'),
+                                  legend=alt.Legend(
+                        title='秒數類型',
+                        orient='right',
+                        titleFontSize=12,
+                        labelFontSize=10
+                    )),
+                    order=alt.Order('秒數類型:O', sort='ascending'),
+                    tooltip=['月份', '秒數類型', alt.Tooltip('比例:Q', format='.1f', title='比例 (%)')]
+                ).properties(width=700, height=400)
+                
+                text_chart = alt.Chart(chart_df_type_melted_sorted[chart_df_type_melted_sorted['比例標籤'] != '']).mark_text(
+                    align='center',
+                    baseline='middle',
+                    fontSize=10,
+                    fontWeight='bold',
+                    fill='white'
+                ).encode(
+                    x=alt.X('月份:O', title='月份'),
+                    y=alt.Y('段中間位置:Q', title='比例 (%)', 
+                           axis=alt.Axis(format='.1f'),
+                           scale=alt.Scale(domain=[0, 100])),
+                    text=alt.Text('比例標籤:N'),
+                    color=alt.Color('秒數類型:N', legend=None)
+                )
+                
+                chart_type = (bar_chart + text_chart).properties(width=700, height=400)
+                img_data = _chart_to_image(chart_type)
+                if img_data:
+                    img = ExcelImage(img_data)
+                    img.width = 700
+                    img.height = 400
+                    ws2.add_image(img, 'A3')
+            except Exception:
+                pass
+            
+            # 添加表格
+            proportion_df = proportion.reset_index()
+            proportion_df.columns = ['秒數類型'] + month_cols
+            _add_dataframe_to_sheet(ws2, proportion_df, start_row=25, apply_color=False)
+        
+        # 總結表數字：各實體
+        for ent in ANNUAL_SUMMARY_ENTITY_LABELS:
+            block = annual_viz.get('entities', {}).get(ent)
+            if not block:
+                continue
+            
+            ws_ent = wb.create_sheet(f"{ent}")
+            ws_ent['A1'] = f"{summary_year} {ent}"
+            ws_ent['A1'].font = Font(bold=True, size=12)
+            ws_ent.merge_cells('A1:N1')
+            
+            # 秒數用途分列
+            _bt = block.get('by_type_df')
+            if _bt is not None and not _bt.empty:
+                ws_ent['A3'] = f"{ent} 秒數用途分列（1月～12月）"
+                ws_ent['A3'].font = Font(bold=True, size=11)
+                _add_dataframe_to_sheet(ws_ent, _bt, start_row=4, apply_color=False)
+            
+            # 使用/未使用/使用率
+            summary_table = pd.DataFrame([
+                block.get('used_row', {}),
+                block.get('unused_row', {}),
+                block.get('usage_rate_row', {}),
+            ])
+            if not summary_table.empty:
+                start_row = len(_bt) + 6 if _bt is not None and not _bt.empty else 4
+                ws_ent.cell(row=start_row, column=1).value = f"{ent} 使用/未使用/使用率（1月～12月）"
+                ws_ent.cell(row=start_row, column=1).font = Font(bold=True, size=11)
+                _add_dataframe_to_sheet(ws_ent, summary_table, start_row=start_row + 1, apply_color=True)
+        
+        wb.save(buf)
+        buf.seek(0)
+        return buf.getvalue()
+    except Exception as e:
+        return None
+
+def _build_visualization_summary_pdf(annual_viz, summary_year):
+    """
+    將總結表視覺化分頁產出為 PDF 二進位內容。
+    包含：① 各媒體平台使用率 ② 各秒數類型使用比例，以及對應的總結表數字。
+    包含完整的圖表（轉換為圖片）。
+    回傳 bytes，若失敗回傳 None。
+    """
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, Image
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        import altair as alt
+        try:
+            import vl_convert as vlc
+        except ImportError:
+            vlc = None
+    except ImportError:
+        return None
+    
+    buf = io.BytesIO()
+    # 註冊中文字型
+    pdf_font_name = None
+    windir = os.environ.get('WINDIR', 'C:/Windows')
+    font_candidates = [
+        (os.path.join(windir, 'Fonts', 'msjh.ttf'), 'CJK'),
+        (os.path.join(windir, 'Fonts', 'mingliu.ttc'), 'CJK'),
+        (os.path.join(windir, 'Fonts', 'msjh.ttc'), 'CJK'),
+        (os.path.join(windir, 'Fonts', 'simsun.ttc'), 'CJK'),
+        (os.path.join(windir, 'Fonts', 'simhei.ttf'), 'CJK'),
+        ('/System/Library/Fonts/PingFang.ttc', 'CJK'),
+        ('/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc', 'CJK'),
+    ]
+    for font_path, name in font_candidates:
+        if not os.path.isfile(font_path):
+            continue
+        try:
+            if font_path.lower().endswith('.ttc'):
+                pdfmetrics.registerFont(TTFont(name, font_path, subfontIndex=0))
+            else:
+                pdfmetrics.registerFont(TTFont(name, font_path))
+            pdf_font_name = name
+            break
+        except Exception:
+            continue
+    if not pdf_font_name:
+        try:
+            from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+            pdfmetrics.registerFont(UnicodeCIDFont('HeiseiMin-W3'))
+            pdf_font_name = 'HeiseiMin-W3'
+        except Exception:
+            pass
+    if not pdf_font_name:
+        return None
+    
+    try:
+        # 調整頁面邊距，給表格更多空間
+        doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=30, leftMargin=30, topMargin=40, bottomMargin=30)
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            name='CJKTitle',
+            parent=styles['Title'],
+            fontName=pdf_font_name,
+            fontSize=16,
+        )
+        heading_style = ParagraphStyle(
+            name='CJKHeading2',
+            parent=styles['Heading2'],
+            fontName=pdf_font_name,
+            fontSize=12,
+        )
+        normal_style = ParagraphStyle(
+            name='CJKNormal',
+            parent=styles['Normal'],
+            fontName=pdf_font_name,
+            fontSize=9,
+        )
+        story = []
+        
+        # 標題
+        title = Paragraph(f"<b>📉 總結表視覺化 {summary_year}</b>", title_style)
+        story.append(title)
+        story.append(Spacer(1, 12))
+        
+        month_cols = [f"{m}月" for m in range(1, 13)]
+        
+        def _df_to_table_data(df):
+            if df is None or df.empty:
+                return []
+            data = []
+            # 添加列標題
+            if not df.empty:
+                # 將列標題轉換為較短的顯示名稱（如果太長）
+                header = []
+                for col in df.columns:
+                    col_str = str(col)
+                    # 如果列名太長，截斷或簡化
+                    if len(col_str) > 8:
+                        col_str = col_str[:6] + '..'
+                    header.append(col_str)
+                data.append(header)
+                # 添加數據行
+                for idx, row in df.iterrows():
+                    row_data = []
+                    for val in row.values:
+                        val_str = str(val)
+                        # 格式化數字：如果是百分比，保留小數點後1位
+                        try:
+                            val_float = float(val)
+                            if '%' in str(val) or (isinstance(val, str) and val.endswith('%')):
+                                val_str = f"{val_float:.1f}%"
+                            elif abs(val_float) >= 1000:
+                                val_str = f"{val_float:,.0f}"
+                            elif abs(val_float) >= 1:
+                                val_str = f"{val_float:.1f}"
+                            else:
+                                val_str = f"{val_float:.2f}"
+                        except (ValueError, TypeError):
+                            # 如果不是數字，保持原樣但限制長度
+                            if len(val_str) > 12:
+                                val_str = val_str[:10] + '..'
+                        row_data.append(val_str)
+                    data.append(row_data)
+            return data
+        
+        def _get_cell_color(val_str, row_name=""):
+            """根據數值返回單元格背景色和文字顏色"""
+            try:
+                # 移除百分號和逗號，轉換為浮點數
+                val_clean = str(val_str).replace('%', '').replace(',', '').strip()
+                val_float = float(val_clean)
+                
+                # 如果是使用率相關的行（包含"使用率"關鍵字）
+                if '使用率' in str(row_name) or '%' in str(val_str):
+                    if val_float >= 100:
+                        return colors.HexColor('#ff6b6b'), colors.white  # 紅色背景，白色文字
+                    elif val_float >= 70:
+                        return colors.HexColor('#ffd93d'), colors.black  # 黃色背景，黑色文字
+                    elif val_float >= 50:
+                        return colors.HexColor('#6bcf7f'), colors.black  # 綠色背景，黑色文字
+                    else:
+                        return colors.white, colors.black  # 白色背景，黑色文字
+                else:
+                    # 非使用率數據：使用淺色背景
+                    return colors.white, colors.black
+            except (ValueError, TypeError):
+                return colors.white, colors.black
+        
+        def _add_table(data, col_widths=None, title=None, apply_color=False):
+            if not data:
+                return
+            if title:
+                story.append(Paragraph(f"<b>{title}</b>", heading_style))
+                story.append(Spacer(1, 6))
+            
+            ncols = len(data[0]) if data else 0
+            if ncols == 0:
+                return
+            
+            # 計算可用寬度（A4 寬度 - 左右邊距）
+            available_width = A4[0] - 60  # 左右各30
+            
+            # 根據列數智能分配列寬
+            if col_widths is None:
+                if ncols <= 4:
+                    # 少列數：平均分配
+                    col_widths = [available_width / ncols] * ncols
+                elif ncols <= 13:
+                    # 月份表格：第一列（項目名稱）較寬，其他列較窄
+                    first_col_width = available_width * 0.25
+                    other_col_width = (available_width - first_col_width) / (ncols - 1)
+                    col_widths = [first_col_width] + [other_col_width] * (ncols - 1)
+                else:
+                    # 很多列：使用最小寬度
+                    min_col_width = max(25, available_width / ncols)
+                    col_widths = [min_col_width] * ncols
+            
+            # 確保總寬度不超過可用寬度
+            total_width = sum(col_widths)
+            if total_width > available_width:
+                scale = available_width / total_width
+                col_widths = [w * scale for w in col_widths]
+            
+            t = Table(data, colWidths=col_widths, repeatRows=1)  # repeatRows=1 讓標題在每頁重複
+            
+            # 基礎表格樣式
+            table_style = [
+                # 字體和大小
+                ('FONTNAME', (0, 0), (-1, -1), pdf_font_name),
+                ('FONTSIZE', (0, 0), (-1, 0), 9),  # 標題行稍大
+                ('FONTSIZE', (0, 1), (-1, -1), 7),  # 數據行較小
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+                
+                # 邊框
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('LINEBELOW', (0, 0), (-1, 0), 1, colors.black),  # 標題行下方粗線
+                
+                # 標題行背景色
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#e0e0e0')),  # 稍深的灰色
+                
+                # 對齊
+                ('ALIGN', (0, 0), (0, -1), 'LEFT'),  # 第一列左對齊（通常是項目名稱）
+                ('ALIGN', (1, 0), (-1, -1), 'CENTER'),  # 其他列居中
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                
+                # 內邊距
+                ('LEFTPADDING', (0, 0), (-1, -1), 4),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 4),
+                ('TOPPADDING', (0, 0), (-1, -1), 3),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+            ]
+            
+            # 如果啟用顏色，為數據單元格添加條件顏色
+            if apply_color and len(data) > 1:
+                for row_idx in range(1, len(data)):  # 跳過標題行
+                    row_name = data[row_idx][0] if data[row_idx] else ""  # 第一列通常是項目名稱
+                    for col_idx in range(len(data[row_idx])):
+                        if col_idx == 0:
+                            # 第一列（項目名稱）：淺灰背景
+                            table_style.append(('BACKGROUND', (col_idx, row_idx), (col_idx, row_idx), colors.HexColor('#f5f5f5')))
+                            table_style.append(('TEXTCOLOR', (col_idx, row_idx), (col_idx, row_idx), colors.black))
+                        else:
+                            # 數據列：根據數值應用顏色
+                            cell_val = data[row_idx][col_idx] if col_idx < len(data[row_idx]) else ""
+                            bg_color, text_color = _get_cell_color(cell_val, row_name)
+                            table_style.append(('BACKGROUND', (col_idx, row_idx), (col_idx, row_idx), bg_color))
+                            table_style.append(('TEXTCOLOR', (col_idx, row_idx), (col_idx, row_idx), text_color))
+            else:
+                # 不啟用顏色時，使用交替行顏色
+                table_style.append(('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f9f9f9')]))
+            
+            t.setStyle(TableStyle(table_style))
+            story.append(t)
+            story.append(Spacer(1, 10))
+        
+        # 輔助函數：將 Altair 圖表轉換為圖片並添加到 PDF
+        def _add_chart_image(chart, width=500):
+            """將 Altair 圖表轉換為圖片並添加到 PDF"""
+            if vlc is None:
+                return  # 如果沒有 vl-convert，跳過圖表
+            try:
+                # 將圖表轉換為 PNG
+                png_data = vlc.vegalite_to_png(chart.to_json(), scale=2)
+                # 將 PNG 數據保存到臨時 BytesIO
+                img_buf = io.BytesIO(png_data)
+                # 創建 ReportLab Image 對象
+                img = Image(img_buf, width=width, height=width * 0.57)  # 保持 700:400 的比例
+                story.append(img)
+                story.append(Spacer(1, 10))
+            except Exception:
+                pass  # 如果轉換失敗，跳過圖表
+        
+        # ① 各媒體平台使用率
+        story.append(Paragraph("<b>① 各媒體平台使用率隨時間變化趨勢</b>", heading_style))
+        story.append(Spacer(1, 6))
+        if annual_viz.get('top_usage_df') is not None and not annual_viz['top_usage_df'].empty:
+            top_df = annual_viz['top_usage_df'].copy()
+            top_df['媒體平台'] = top_df['項目'].str.replace("使用率", "", regex=False)
+            chart_df_platform = top_df.set_index("媒體平台")[month_cols].T
+            chart_df_platform.index.name = "月份"
+            
+            # 創建折線圖
+            try:
+                chart_df_platform_melted = chart_df_platform.reset_index().melt(id_vars='月份', var_name='媒體平台', value_name='使用率')
+                chart_df_platform_melted['使用率標籤'] = chart_df_platform_melted['使用率'].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "")
+                
+                line_chart = alt.Chart(chart_df_platform_melted).mark_line(point=True).encode(
+                    x=alt.X('月份:O', title='月份'),
+                    y=alt.Y('使用率:Q', title='使用率 (%)', axis=alt.Axis(format='.1f')),
+                    color=alt.Color('媒體平台:N', title='媒體平台'),
+                    tooltip=['月份', '媒體平台', alt.Tooltip('使用率:Q', format='.1f', title='使用率 (%)')]
+                ).properties(width=700, height=400)
+                
+                text_chart = alt.Chart(chart_df_platform_melted).mark_text(
+                    align='center',
+                    baseline='bottom',
+                    dy=-8,
+                    fontSize=10
+                ).encode(
+                    x=alt.X('月份:O', title='月份'),
+                    y=alt.Y('使用率:Q', title='使用率 (%)', axis=alt.Axis(format='.1f')),
+                    text=alt.Text('使用率標籤:N'),
+                    color=alt.Color('媒體平台:N', legend=None)
+                )
+                
+                chart_platform = (line_chart + text_chart).properties(width=700, height=400)
+                _add_chart_image(chart_platform, width=500)
+            except Exception:
+                pass
+            
+            # 添加表格（啟用顏色美化）
+            data = _df_to_table_data(top_df)
+            _add_table(data, title="對應數字表：年度使用率（各實體 × 1月~12月）", apply_color=True)
+        
+        story.append(PageBreak())
+        
+        # ② 各秒數類型使用比例
+        story.append(Paragraph("<b>② 各秒數類型使用比例隨時間變化趨勢</b>", heading_style))
+        story.append(Spacer(1, 6))
+        by_type_agg = None
+        for ent in ANNUAL_SUMMARY_ENTITY_LABELS:
+            block = annual_viz.get('entities', {}).get(ent)
+            if not block or block.get('by_type_df') is None:
+                continue
+            bt = block['by_type_df'].set_index("項目")[month_cols]
+            if by_type_agg is None:
+                by_type_agg = bt.copy()
+            else:
+                by_type_agg = by_type_agg + bt
+        
+        if by_type_agg is not None and not by_type_agg.empty:
+            # 計算百分比
+            monthly_total = by_type_agg.sum(axis=0)
+            proportion = by_type_agg.copy()
+            for c in month_cols:
+                if monthly_total.get(c, 0) and monthly_total[c] > 0:
+                    proportion[c] = (by_type_agg[c] / monthly_total[c] * 100)
+                else:
+                    proportion[c] = 0
+            
+            # 確保每個月份的比例加總為100%
+            for col in proportion.columns:
+                monthly_sum = proportion[col].sum()
+                if monthly_sum > 0 and abs(monthly_sum - 100) > 0.01:
+                    proportion[col] = proportion[col] / monthly_sum * 100
+            
+            chart_df_type = proportion.T
+            chart_df_type.index.name = "月份"
+            
+            # 創建堆疊長條圖
+            try:
+                chart_df_type_melted = chart_df_type.reset_index().melt(id_vars='月份', var_name='秒數類型', value_name='比例')
+                chart_df_type_melted['比例'] = pd.to_numeric(chart_df_type_melted['比例'], errors='coerce').fillna(0)
+                chart_df_type_melted['比例'] = chart_df_type_melted['比例'].clip(lower=0)
+                
+                # 確保每個月份都有所有秒數類型的數據
+                all_types = chart_df_type_melted['秒數類型'].unique()
+                all_months = chart_df_type_melted['月份'].unique()
+                complete_data = []
+                for month in all_months:
+                    for sec_type in all_types:
+                        existing = chart_df_type_melted[(chart_df_type_melted['月份'] == month) & 
+                                                       (chart_df_type_melted['秒數類型'] == sec_type)]
+                        if existing.empty:
+                            complete_data.append({'月份': month, '秒數類型': sec_type, '比例': 0})
+                        else:
+                            complete_data.append(existing.iloc[0].to_dict())
+                chart_df_type_melted = pd.DataFrame(complete_data)
+                
+                # 重新計算比例百分比
+                chart_df_type_melted['比例'] = chart_df_type_melted.groupby('月份')['比例'].transform(
+                    lambda x: (x / x.sum() * 100) if x.sum() > 0 else 0
+                )
+                
+                chart_df_type_melted['比例標籤'] = chart_df_type_melted.apply(
+                    lambda row: f"{row['比例']:.1f}%" if pd.notna(row['比例']) and row['比例'] > 2 else "", 
+                    axis=1
+                )
+                
+                chart_df_type_melted_sorted = chart_df_type_melted.sort_values(['月份', '秒數類型']).copy()
+                chart_df_type_melted_sorted = chart_df_type_melted_sorted.reset_index(drop=True)
+                chart_df_type_melted_sorted['累積起始'] = chart_df_type_melted_sorted.groupby('月份')['比例'].transform(
+                    lambda x: x.shift(1).fillna(0).cumsum()
+                )
+                chart_df_type_melted_sorted['段中間位置'] = (
+                    chart_df_type_melted_sorted['累積起始'] + chart_df_type_melted_sorted['比例'] / 2
+                )
+                
+                bar_chart = alt.Chart(chart_df_type_melted_sorted).mark_bar().encode(
+                    x=alt.X('月份:O', title='月份'),
+                    y=alt.Y('比例:Q', title='比例 (%)', 
+                           axis=alt.Axis(format='.1f'),
+                           stack=True,
+                           scale=alt.Scale(domain=[0, 100])),
+                    color=alt.Color('秒數類型:N', title='秒數類型', 
+                                  sort=alt.SortField('秒數類型', order='ascending'),
+                                  legend=alt.Legend(
+                        title='秒數類型',
+                        orient='right',
+                        titleFontSize=12,
+                        labelFontSize=10
+                    )),
+                    order=alt.Order('秒數類型:O', sort='ascending'),
+                    tooltip=['月份', '秒數類型', alt.Tooltip('比例:Q', format='.1f', title='比例 (%)')]
+                ).properties(width=700, height=400)
+                
+                text_chart = alt.Chart(chart_df_type_melted_sorted[chart_df_type_melted_sorted['比例標籤'] != '']).mark_text(
+                    align='center',
+                    baseline='middle',
+                    fontSize=10,
+                    fontWeight='bold',
+                    fill='white'
+                ).encode(
+                    x=alt.X('月份:O', title='月份'),
+                    y=alt.Y('段中間位置:Q', title='比例 (%)', 
+                           axis=alt.Axis(format='.1f'),
+                           scale=alt.Scale(domain=[0, 100])),
+                    text=alt.Text('比例標籤:N'),
+                    color=alt.Color('秒數類型:N', legend=None)
+                )
+                
+                chart_type = (bar_chart + text_chart).properties(width=700, height=400)
+                _add_chart_image(chart_type, width=500)
+            except Exception:
+                pass
+            
+            # 添加表格（不啟用顏色，因為這是比例數據）
+            proportion_df = proportion.reset_index()
+            proportion_df.columns = ['秒數類型'] + month_cols
+            data = _df_to_table_data(proportion_df)
+            _add_table(data, apply_color=False)
+        
+        story.append(PageBreak())
+        
+        # 總結表數字：各實體
+        story.append(Paragraph("<b>📊 總結表數字</b>", heading_style))
+        story.append(Spacer(1, 6))
+        
+        for ent in ANNUAL_SUMMARY_ENTITY_LABELS:
+            block = annual_viz.get('entities', {}).get(ent)
+            if not block:
+                continue
+            
+            story.append(Paragraph(f"<b>{summary_year} {ent}</b>", heading_style))
+            story.append(Spacer(1, 6))
+            
+            # 秒數用途分列（不啟用顏色）
+            _bt = block.get('by_type_df')
+            if _bt is not None and not _bt.empty:
+                data = _df_to_table_data(_bt)
+                _add_table(data, title=f"{ent} 秒數用途分列（1月～12月）", apply_color=False)
+            
+            # 使用/未使用/使用率（啟用顏色美化，特別是使用率）
+            summary_table = pd.DataFrame([
+                block.get('used_row', {}),
+                block.get('unused_row', {}),
+                block.get('usage_rate_row', {}),
+            ])
+            if not summary_table.empty:
+                data = _df_to_table_data(summary_table)
+                _add_table(data, title=f"{ent} 使用/未使用/使用率（1月～12月）", apply_color=True)
+            
+            story.append(Spacer(1, 10))
+        
+        doc.build(story)
+        buf.seek(0)
+        return buf.getvalue()
+    except Exception as e:
+        return None
+
 def _build_annual_summary_pdf(annual, summary_year):
     """
     將年度使用秒數總表產出為 PDF 二進位內容。使用系統中文字型以正確顯示中文。
@@ -2997,15 +3941,31 @@ st.sidebar.title("⚙️ 控制台")
 
 # 模擬資料：每次產出 200 筆 2026 年模擬資料供介面呈現
 st.sidebar.markdown("### 📊 資料來源")
-if st.sidebar.button("🎲 產生模擬資料 (200 筆 2026)", type="primary", help="隨機產生 200 筆 2026 年模擬訂單，供介面呈現使用"):
-    with st.spinner("正在產生 200 筆 2026 年模擬資料..."):
-        success, msg = load_mock_data_to_db(n=200)
-        if success:
-            st.sidebar.success(msg)
-            time.sleep(0.5)
-            st.rerun()
-        else:
-            st.sidebar.error(f"產生失敗: {msg}")
+col_mock1, col_mock2 = st.sidebar.columns(2)
+with col_mock1:
+    if st.button("🎲 產生模擬資料", type="primary", help="隨機產生 200 筆 2026 年模擬訂單，供介面呈現使用", key="btn_mock_orders"):
+        with st.spinner("正在產生 200 筆 2026 年模擬資料..."):
+            success, msg = load_mock_data_to_db(n=200)
+            if success:
+                st.sidebar.success(msg)
+                time.sleep(0.5)
+                st.rerun()
+            else:
+                st.sidebar.error(f"產生失敗: {msg}")
+with col_mock2:
+    if st.button("🎯 資料+容量", type="secondary", help="產生模擬訂單並自動設定容量和採購資料，使使用率控制在 50-120%", key="btn_mock_with_capacity"):
+        with st.spinner("正在產生模擬資料、容量設定與採購資料..."):
+            success, msg = load_mock_data_with_capacity_to_db(n=200, year=2026)
+            if success:
+                # 清除「📋 媒體秒數與採購」頁面的 session_state，確保顯示最新資料
+                to_del = [k for k in st.session_state if str(k).startswith("purchase_sec_") or str(k).startswith("purchase_price_")]
+                for k in to_del:
+                    del st.session_state[k]
+                st.sidebar.success(msg)
+                time.sleep(0.5)
+                st.rerun()
+            else:
+                st.sidebar.error(f"產生失敗: {msg}")
 
 # 匯入 Google 試算表（表1結構）
 with st.sidebar.expander("📥 匯入 Google 試算表（表1結構）", expanded=False):
@@ -3097,12 +4057,12 @@ if df_daily.empty and not df_orders.empty:
         df_daily = _explode_segments_to_daily_cached(df_seg_main) if not df_seg_main.empty else pd.DataFrame()
 
 # --- 分頁呈現（角色導向入口 + 只渲染當前分頁）---
-TAB_OPTIONS = ["📋 表1-資料", "📅 表2-秒數明細", "📊 表3-每日庫存", "📈 總結表", "📉 總結表圖表", "📊 分公司×媒體 每月秒數", "📋 媒體秒數與採購", "🧪 實驗分頁", "📊 ROI 實驗"]
-# 各角色可見分頁：行政主管=全部(預設)、業務=表1+表3(唯讀)、總經理=總結表+表3+表2(不呈現表1)
+TAB_OPTIONS = ["📋 表1-資料", "📅 表2-秒數明細", "📊 表3-每日庫存", "📉 總結表圖表", "📊 分公司×媒體 每月秒數", "📋 媒體秒數與採購", "🧪 實驗分頁", "📊 ROI 實驗"]
+# 各角色可見分頁：行政主管=全部(預設)、業務=表1+表3(唯讀)、總經理=總結表圖表+表3+表2(不呈現表1)
 TAB_OPTIONS_BY_ROLE = {
     "行政主管": TAB_OPTIONS,  # 擁有所有權限，預設角色
     "業務": ["📋 表1-資料", "📊 表3-每日庫存"],
-    "總經理": ["📈 總結表", "📊 表3-每日庫存", "📅 表2-秒數明細", "📉 總結表圖表", "📊 分公司×媒體 每月秒數", "📋 媒體秒數與採購", "🧪 實驗分頁", "📊 ROI 實驗"],
+    "總經理": ["📉 總結表圖表", "📊 表3-每日庫存", "📅 表2-秒數明細", "📊 分公司×媒體 每月秒數", "📋 媒體秒數與採購", "🧪 實驗分頁", "📊 ROI 實驗"],
 }
 
 st.markdown("#### 你現在的身份是？")
@@ -3708,176 +4668,6 @@ elif selected_tab == "📅 表2-秒數明細":
 elif selected_tab == "📊 表3-每日庫存":
     _render_tab3(role_readonly=(role == "業務"))
 
-elif selected_tab == "📈 總結表":
-    st.markdown("### 📈 年度使用秒數總表")
-    st.caption("對齊 Excel 年度使用秒數總表：頂部為各實體使用率（1月~12月），下方為各實體區塊（企頻／新鮮視／家樂福／診所）之承包、平均每月店秒、秒數用途分列、使用秒數、未使用秒數、使用率。")
-    
-    summary_year = datetime.now().year
-    if not df_daily.empty and '日期' in df_daily.columns:
-        df_daily['日期'] = pd.to_datetime(df_daily['日期'], errors='coerce')
-        valid = df_daily['日期'].dropna()
-        if len(valid) > 0:
-            summary_year = int(valid.min().year)
-    summary_year = st.number_input("年度", min_value=2020, max_value=2030, value=summary_year, key="summary_year")
-    
-    if not df_daily.empty and '使用店秒' in df_daily.columns:
-        # 使用表3 的「當月每日可用秒數」作為月容量（若無設定則該月容量為 0，使用率不顯示或為 0）
-        def _monthly_cap(mp, y, m):
-            return get_platform_monthly_capacity(mp, y, m)
-        annual = build_annual_seconds_summary(df_daily, summary_year, monthly_capacity_loader=_monthly_cap)
-        
-        if annual:
-            def _style_pct(val):
-                if not isinstance(val, (int, float)) or pd.isna(val):
-                    return ''
-                if val >= 100:
-                    return 'background-color: #ff6b6b; color: white'
-                if val >= 70:
-                    return 'background-color: #ffd93d'
-                if val >= 50:
-                    return 'background-color: #6bcf7f'
-                return ''
-
-            def _round_table_one_decimal(df):
-                """總結表頁：所有表格內數字最多取到小數點第一位。"""
-                if df is None or df.empty:
-                    return df
-                out = df.copy()
-                num_cols = out.select_dtypes(include=[np.number]).columns.tolist()
-                if num_cols:
-                    out[num_cols] = out[num_cols].round(1)
-                return out
-
-            # 使用率圖例
-            st.markdown("#### 🎨 使用率圖例")
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.markdown("🟢 **綠**：50%+")
-            with c2:
-                st.markdown("🟡 **黃**：70%+")
-            with c3:
-                st.markdown("🔴 **紅**：100%+")
-            
-            # 上下半年各一個表格（不再分季）；表格不設固定高度，完整延展、不需表格內上下滑動
-            _h1_cols = ['項目', '1月', '2月', '3月', '4月', '5月', '6月']
-            _h2_cols = ['項目', '7月', '8月', '9月', '10月', '11月', '12月']
-            _month_cols_h1 = _h1_cols[1:]
-            _month_cols_h2 = _h2_cols[1:]
-
-            # 頂部：年度使用率（上半年一個表、下半年一個表）
-            if annual.get('top_usage_df') is not None and not annual['top_usage_df'].empty:
-                st.markdown("#### 📊 年度使用率（各實體 × 1月~12月）")
-                top_df = _round_table_one_decimal(annual['top_usage_df'].copy())
-                st.caption("**上半年（1月～6月）**")
-                top_h1 = top_df[_h1_cols]
-                st.dataframe(
-                    top_h1.style.format({c: "{:.1f}" for c in _month_cols_h1}).apply(
-                        lambda row: [_style_pct(row.get(c)) if c in _month_cols_h1 else '' for c in top_h1.columns],
-                        axis=1
-                    ),
-                    use_container_width=True,
-                )
-                st.caption("**下半年（7月～12月）**")
-                top_h2 = top_df[_h2_cols]
-                st.dataframe(
-                    top_h2.style.format({c: "{:.1f}" for c in _month_cols_h2}).apply(
-                        lambda row: [_style_pct(row.get(c)) if c in _month_cols_h2 else '' for c in top_h2.columns],
-                        axis=1
-                    ),
-                    use_container_width=True,
-                )
-
-            # 各實體區塊：上下半年各一個表格，表格完整延展
-            for ent in ANNUAL_SUMMARY_ENTITY_LABELS:
-                block = annual['entities'].get(ent)
-                if not block:
-                    continue
-                st.markdown(f"#### {summary_year} {ent}")
-                st.caption(f"平均每月店秒：{block['avg_monthly_seconds']:,.0f}" if block['avg_monthly_seconds'] else f"{ent} 當月每日可用秒數請於表3 設定後，此處會顯示容量與使用率。")
-                # 秒數用途分列：上半年一個表、下半年一個表（數字最多小數點第一位）
-                by_type = _round_table_one_decimal(block['by_type_df'].copy())
-                if all(c in by_type.columns for c in _h1_cols + _h2_cols):
-                    st.caption("秒數用途分列 — **上半年**")
-                    st.dataframe(by_type[_h1_cols].style.format({c: "{:.1f}" for c in _month_cols_h1}), use_container_width=True)
-                    st.caption("秒數用途分列 — **下半年**")
-                    st.dataframe(by_type[_h2_cols].style.format({c: "{:.1f}" for c in _month_cols_h2}), use_container_width=True)
-                else:
-                    _by_type_month_cols = [c for c in by_type.columns if c != '項目']
-                    st.dataframe(by_type.style.format({c: "{:.1f}" for c in _by_type_month_cols}) if _by_type_month_cols else by_type, use_container_width=True)
-                # 使用／未使用／使用率：上半年一個表、下半年一個表（數字最多小數點第一位）
-                summary_table = _round_table_one_decimal(pd.DataFrame([
-                    block['used_row'],
-                    block['unused_row'],
-                    block['usage_rate_row'],
-                ]))
-                if all(c in summary_table.columns for c in _h1_cols + _h2_cols):
-                    st.caption("使用／未使用／使用率 — **上半年**")
-                    part_h1 = summary_table[_h1_cols]
-                    st.dataframe(
-                        part_h1.style.format({c: "{:.1f}" for c in _month_cols_h1}).apply(
-                            lambda row: [_style_pct(row.get(c)) if (row.get('項目') or '').endswith('使用率') and c in _month_cols_h1 else '' for c in part_h1.columns],
-                            axis=1
-                        ),
-                        use_container_width=True,
-                    )
-                    st.caption("使用／未使用／使用率 — **下半年**")
-                    part_h2 = summary_table[_h2_cols]
-                    st.dataframe(
-                        part_h2.style.format({c: "{:.1f}" for c in _month_cols_h2}).apply(
-                            lambda row: [_style_pct(row.get(c)) if (row.get('項目') or '').endswith('使用率') and c in _month_cols_h2 else '' for c in part_h2.columns],
-                            axis=1
-                        ),
-                        use_container_width=True,
-                    )
-                else:
-                    def _apply_summary_style(row):
-                        return [_style_pct(row.get(c)) if (row.get('項目') or '').endswith('使用率') and c.endswith('月') else '' for c in summary_table.columns]
-                    _summary_month_cols = [c for c in summary_table.columns if c.endswith('月')]
-                    st.dataframe(summary_table.style.format({c: "{:.1f}" for c in _summary_month_cols}).apply(_apply_summary_style, axis=1), use_container_width=True)
-
-            # 下載：Excel 與 PDF
-            st.markdown("#### 📥 下載年度總結")
-            dl_col1, dl_col2 = st.columns(2)
-            try:
-                from io import BytesIO
-                buf = BytesIO()
-                with pd.ExcelWriter(buf, engine='openpyxl') as w:
-                    if annual.get('top_usage_df') is not None and not annual['top_usage_df'].empty:
-                        annual['top_usage_df'].to_excel(w, sheet_name='年度使用率', index=False)
-                    for ent in ANNUAL_SUMMARY_ENTITY_LABELS:
-                        block = annual['entities'].get(ent)
-                        if block:
-                            block['by_type_df'].to_excel(w, sheet_name=f'{ent}_秒數用途', index=False)
-                            pd.DataFrame([block['used_row'], block['unused_row'], block['usage_rate_row']]).to_excel(w, sheet_name=f'{ent}_使用未使用率', index=False)
-                buf.seek(0)
-                with dl_col1:
-                    st.download_button(
-                        label="📥 下載年度使用秒數總表 Excel",
-                        data=buf.getvalue(),
-                        file_name=f"年度使用秒數總表_{summary_year}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="dl_annual_summary"
-                    )
-            except Exception as e:
-                with dl_col1:
-                    st.caption(f"下載 Excel 時發生錯誤：{e}")
-            pdf_bytes = _build_annual_summary_pdf(annual, summary_year)
-            with dl_col2:
-                if pdf_bytes:
-                    st.download_button(
-                        label="📄 匯出 PDF",
-                        data=pdf_bytes,
-                        file_name=f"年度使用秒數總表_{summary_year}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
-                        mime="application/pdf",
-                        key="dl_annual_summary_pdf"
-                    )
-                else:
-                    st.caption("匯出 PDF 需安裝 reportlab：pip install reportlab")
-        else:
-            st.warning("📭 尚無每日資料或媒體平台欄位，請先產生模擬資料。")
-    else:
-        st.warning("📭 尚無每日資料，請先產生模擬資料。")
-
 elif selected_tab == "📉 總結表圖表":
     st.markdown("### 📉 總結表視覺化")
     st.caption("圖表與數字表格一併呈現：① 各媒體平台使用率 ② 各秒數類型使用比例；下方為對應的總結表數字。")
@@ -3917,13 +4707,48 @@ elif selected_tab == "📉 總結表圖表":
                 top_df['媒體平台'] = top_df['項目'].str.replace("使用率", "", regex=False)
                 chart_df_platform = top_df.set_index("媒體平台")[month_cols].T
                 chart_df_platform.index.name = "月份"
-                st.line_chart(chart_df_platform)
+                # 使用 Altair 顯示使用率圖表，Y 軸加上 % 符號
+                try:
+                    import altair as alt
+                    chart_df_platform_melted = chart_df_platform.reset_index().melt(id_vars='月份', var_name='媒體平台', value_name='使用率')
+                    
+                    # 創建帶數據標籤的折線圖
+                    # 先創建折線圖
+                    line_chart = alt.Chart(chart_df_platform_melted).mark_line(point=True).encode(
+                        x=alt.X('月份:O', title='月份'),
+                        y=alt.Y('使用率:Q', title='使用率 (%)', axis=alt.Axis(format='.1f')),
+                        color=alt.Color('媒體平台:N', title='媒體平台'),
+                        tooltip=['月份', '媒體平台', alt.Tooltip('使用率:Q', format='.1f', title='使用率 (%)')]
+                    ).properties(width=700, height=400)
+                    
+                    # 添加數據標籤（在每個點上方顯示數值，格式為 "33.0%"）
+                    # 創建格式化後的標籤文字
+                    chart_df_platform_melted['使用率標籤'] = chart_df_platform_melted['使用率'].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "")
+                    text_chart = alt.Chart(chart_df_platform_melted).mark_text(
+                        align='center',
+                        baseline='bottom',
+                        dy=-8,  # 標籤位置在點的上方
+                        fontSize=10
+                    ).encode(
+                        x=alt.X('月份:O', title='月份'),
+                        y=alt.Y('使用率:Q', title='使用率 (%)', axis=alt.Axis(format='.1f')),
+                        text=alt.Text('使用率標籤:N'),  # 使用格式化後的標籤文字
+                        color=alt.Color('媒體平台:N', legend=None)  # 標籤顏色與線條一致，但不顯示圖例
+                    )
+                    
+                    # 合併折線圖和標籤
+                    chart = (line_chart + text_chart).properties(width=700, height=400)
+                    st.altair_chart(chart, use_container_width=True)
+                except ImportError:
+                    st.line_chart(chart_df_platform)
                 st.markdown("**對應數字表：年度使用率（各實體 × 1月~12月）**")
                 st.caption("🟢 50%+　🟡 70%+　🔴 100%+")
                 top_tbl = annual_viz['top_usage_df'].copy()
                 _month_cols_viz = [c for c in top_tbl.columns if c != '項目']
-                styled_top = top_tbl.style.format({c: "{:.1f}" for c in _month_cols_viz}).apply(lambda row: [_style_pct_viz(row.get(c)) for c in top_tbl.columns], axis=1)
-                st.dataframe(styled_top, use_container_width=True, height=180)
+                def _style_top_table(df_subset):
+                    _sub_month_cols = [c for c in _month_cols_viz if c in df_subset.columns]
+                    return df_subset.style.format({c: "{:.1f}%" for c in _sub_month_cols}).apply(lambda row: [_style_pct_viz(row.get(c)) for c in df_subset.columns], axis=1)
+                _display_monthly_table_split(top_tbl, _month_cols_viz, style_func=_style_top_table, height=180, key_prefix="top_usage")
             else:
                 st.info("尚無各媒體平台使用率資料（請於表3 設定當月每日可用秒數後再檢視）。")
             
@@ -3940,45 +4765,269 @@ elif selected_tab == "📉 總結表圖表":
                 else:
                     by_type_agg = by_type_agg + bt
             if by_type_agg is not None and not by_type_agg.empty:
+                # 計算百分比數據
                 monthly_total = by_type_agg.sum(axis=0)
                 proportion = by_type_agg.copy()
                 for c in month_cols:
                     if monthly_total.get(c, 0) and monthly_total[c] > 0:
-                        proportion[c] = (by_type_agg[c] / monthly_total[c] * 100).round(1)
+                        proportion[c] = (by_type_agg[c] / monthly_total[c] * 100)
                     else:
                         proportion[c] = 0
+                
+                # 確保每個月份的比例加總為100%（處理浮點數誤差）
+                for col in proportion.columns:
+                    monthly_sum = proportion[col].sum()
+                    if monthly_sum > 0 and abs(monthly_sum - 100) > 0.01:
+                        proportion[col] = proportion[col] / monthly_sum * 100
+                
                 chart_df_type = proportion.T
                 chart_df_type.index.name = "月份"
-                st.area_chart(chart_df_type)
+                
+                # 使用 Altair 顯示堆疊長條圖（比例圖表），並添加數據標籤
+                try:
+                    import altair as alt
+                    chart_df_type_melted = chart_df_type.reset_index().melt(id_vars='月份', var_name='秒數類型', value_name='比例')
+                    
+                    # 確保數值為數值類型，並處理NaN，同時確保所有值都是正數
+                    chart_df_type_melted['比例'] = pd.to_numeric(chart_df_type_melted['比例'], errors='coerce').fillna(0)
+                    chart_df_type_melted['比例'] = chart_df_type_melted['比例'].clip(lower=0)  # 確保沒有負數
+                    
+                    # 確保每個月份都有所有秒數類型的數據（如果缺少則補0）
+                    all_types = chart_df_type_melted['秒數類型'].unique()
+                    all_months = chart_df_type_melted['月份'].unique()
+                    complete_data = []
+                    for month in all_months:
+                        for sec_type in all_types:
+                            existing = chart_df_type_melted[(chart_df_type_melted['月份'] == month) & 
+                                                           (chart_df_type_melted['秒數類型'] == sec_type)]
+                            if existing.empty:
+                                complete_data.append({'月份': month, '秒數類型': sec_type, '比例': 0})
+                            else:
+                                complete_data.append(existing.iloc[0].to_dict())
+                    chart_df_type_melted = pd.DataFrame(complete_data)
+                    
+                    # 確保每個月份的比例加總為100%（再次檢查）
+                    chart_df_type_melted['比例'] = chart_df_type_melted.groupby('月份')['比例'].transform(
+                        lambda x: (x / x.sum() * 100) if x.sum() > 0 else 0
+                    )
+                    
+                    # 創建格式化後的標籤文字（格式為 "33.0%"），只顯示比例大於 2% 的標籤，避免標籤過小
+                    chart_df_type_melted['比例標籤'] = chart_df_type_melted.apply(
+                        lambda row: f"{row['比例']:.1f}%" if pd.notna(row['比例']) and row['比例'] > 2 else "", 
+                        axis=1
+                    )
+                    
+                    # 計算每個堆疊段的中間位置（用於標籤定位）
+                    # 需要按照與長條圖相同的順序排序，然後計算累積位置
+                    # 按照秒數類型排序，確保堆疊順序一致
+                    chart_df_type_melted_sorted = chart_df_type_melted.sort_values(['月份', '秒數類型']).copy()
+                    chart_df_type_melted_sorted = chart_df_type_melted_sorted.reset_index(drop=True)
+                    # 計算每個月份內，每個秒數類型之前的累積比例（作為段的起始位置）
+                    chart_df_type_melted_sorted['累積起始'] = chart_df_type_melted_sorted.groupby('月份')['比例'].transform(
+                        lambda x: x.shift(1).fillna(0).cumsum()
+                    )
+                    # 段中間位置 = 累積起始位置 + 當前段高度的一半
+                    chart_df_type_melted_sorted['段中間位置'] = (
+                        chart_df_type_melted_sorted['累積起始'] + chart_df_type_melted_sorted['比例'] / 2
+                    )
+                    
+                    # 創建堆疊長條圖（使用百分比數據直接堆疊）
+                    # 因為數據已經是百分比（0-100），使用 stack=True 啟用堆疊
+                    bar_chart = alt.Chart(chart_df_type_melted_sorted).mark_bar().encode(
+                        x=alt.X('月份:O', title='月份'),
+                        y=alt.Y('比例:Q', title='比例 (%)', 
+                               axis=alt.Axis(format='.1f'),
+                               stack=True,  # 啟用堆疊功能
+                               scale=alt.Scale(domain=[0, 100])),  # 明確設置Y軸範圍為0-100%
+                        color=alt.Color('秒數類型:N', title='秒數類型', 
+                                      sort=alt.SortField('秒數類型', order='ascending'),  # 確保顏色順序一致
+                                      legend=alt.Legend(
+                            title='秒數類型',
+                            orient='right',
+                            titleFontSize=12,
+                            labelFontSize=10
+                        )),
+                        order=alt.Order('秒數類型:O', sort='ascending'),  # 確保堆疊順序
+                        tooltip=['月份', '秒數類型', alt.Tooltip('比例:Q', format='.1f', title='比例 (%)')]
+                    ).properties(width=700, height=400)
+                    
+                    # 添加數據標籤（在每個堆疊段的中間位置顯示，只顯示比例 > 2% 的標籤）
+                    # 標籤圖表必須使用與長條圖相同的Y軸配置
+                    text_chart = alt.Chart(chart_df_type_melted_sorted[chart_df_type_melted_sorted['比例標籤'] != '']).mark_text(
+                        align='center',
+                        baseline='middle',
+                        fontSize=10,
+                        fontWeight='bold',
+                        fill='white'  # 白色文字更明顯
+                    ).encode(
+                        x=alt.X('月份:O', title='月份'),
+                        y=alt.Y('段中間位置:Q', title='比例 (%)', 
+                               axis=alt.Axis(format='.1f'),
+                               scale=alt.Scale(domain=[0, 100])),  # Y 軸範圍 0-100，與堆疊圖一致
+                        text=alt.Text('比例標籤:N'),  # 使用格式化後的標籤文字
+                        color=alt.Color('秒數類型:N', legend=None)  # 標籤不顯示圖例（圖例由 bar_chart 提供）
+                    )
+                    
+                    # 合併長條圖和標籤
+                    chart = (bar_chart + text_chart).properties(width=700, height=400)
+                    st.altair_chart(chart, use_container_width=True)
+                except ImportError:
+                    st.bar_chart(chart_df_type)
             else:
                 st.info("尚無各秒數類型使用資料。")
             
             # === 總結表數字表格：各實體區塊（秒數用途分列、使用／未使用／使用率）===
             st.markdown("---")
-            st.markdown("#### 📊 總結表數字（與「📈 總結表」分頁相同）")
-            for ent in ANNUAL_SUMMARY_ENTITY_LABELS:
-                block = annual_viz.get('entities', {}).get(ent)
-                if not block:
-                    continue
-                st.markdown(f"**{summary_year_viz} {ent}**")
-                st.caption(f"平均每月店秒：{block['avg_monthly_seconds']:,.0f}" if block['avg_monthly_seconds'] else f"{ent} 當月每日可用秒數請於表3 設定。")
-                _bt = block['by_type_df']
-                _bt_month_cols = [c for c in _bt.columns if c != '項目']
-                st.dataframe(_bt.style.format({c: "{:.1f}" for c in _bt_month_cols}) if _bt_month_cols else _bt, use_container_width=True, height=220)
-                summary_table = pd.DataFrame([
-                    block['used_row'],
-                    block['unused_row'],
-                    block['usage_rate_row'],
-                ])
-                _sum_month_cols = [c for c in summary_table.columns if c.endswith('月')]
-                styled_sum = summary_table.style.format({c: "{:.1f}" for c in _sum_month_cols}).apply(
-                    lambda row: [_style_pct_viz(row.get(c)) if (row.get('項目') or '').endswith('使用率') and c.endswith('月') else '' for c in summary_table.columns],
-                    axis=1
-                )
-                st.dataframe(styled_sum, use_container_width=True, height=140)
+            st.markdown("#### 📊 總結表數字")
             
-            # 下載年度總結
-            st.markdown("#### 📥 下載年度總結")
+            # 使用 st.tabs() 讓用戶輕鬆切換不同實體（最簡單且用戶體驗最好）
+            entity_tabs = st.tabs([f"📍 {ent}" for ent in ANNUAL_SUMMARY_ENTITY_LABELS])
+            
+            for idx, ent in enumerate(ANNUAL_SUMMARY_ENTITY_LABELS):
+                with entity_tabs[idx]:
+                    block = annual_viz.get('entities', {}).get(ent)
+                    if not block:
+                        st.info(f"尚無 {ent} 的資料")
+                        continue
+                    st.markdown(f"**{summary_year_viz} {ent}**")
+                    st.caption(f"平均每月店秒：{block['avg_monthly_seconds']:,.0f}" if block['avg_monthly_seconds'] else f"{ent} 當月每日可用秒數請於表3 設定。")
+                    
+                    # === 該實體的圖表（使用率趨勢、使用/未使用堆疊、秒數用途分列）===
+                    # 圖1：使用率趨勢（1月~12月）
+                    rate_row = block.get('usage_rate_row', {})
+                    if rate_row and any(c.endswith('月') for c in rate_row.keys()):
+                        rate_data = {c: rate_row.get(c, 0) for c in month_cols if c in rate_row}
+                        if rate_data and any(v > 0 for v in rate_data.values()):
+                            df_rate = pd.DataFrame([rate_data], index=[f"{ent}使用率"])
+                            st.markdown(f"**{ent} 使用率趨勢（1月～12月）**")
+                            # 使用 Altair 顯示使用率圖表，Y 軸加上 % 符號
+                            try:
+                                import altair as alt
+                                df_rate_melted = df_rate.T.reset_index()
+                                df_rate_melted.columns = ['月份', '使用率']
+                                chart = alt.Chart(df_rate_melted).mark_line(point=True).encode(
+                                    x=alt.X('月份:O', title='月份'),
+                                    y=alt.Y('使用率:Q', title='使用率 (%)', axis=alt.Axis(format='.1f')),
+                                    tooltip=['月份', alt.Tooltip('使用率:Q', format='.1f', title='使用率 (%)')]
+                                ).properties(width=700, height=300)
+                                st.altair_chart(chart, use_container_width=True)
+                            except ImportError:
+                                st.line_chart(df_rate.T)
+                    
+                    # 圖2：使用/未使用秒數堆疊（1月~12月）
+                    used_row = block.get('used_row', {})
+                    unused_row = block.get('unused_row', {})
+                    if used_row and unused_row:
+                        used_data = {c: used_row.get(c, 0) for c in month_cols if c in used_row}
+                        unused_data = {c: unused_row.get(c, 0) for c in month_cols if c in unused_row}
+                        if used_data or unused_data:
+                            df_usage = pd.DataFrame({
+                                '使用秒數': [used_data.get(c, 0) for c in month_cols],
+                                '未使用秒數': [unused_data.get(c, 0) for c in month_cols]
+                            }, index=month_cols)
+                            st.markdown(f"**{ent} 使用/未使用秒數（1月～12月）**")
+                            st.area_chart(df_usage)
+                    
+                    # 圖3：秒數用途分列趨勢（1月~12月）
+                    _bt = block['by_type_df']
+                    if not _bt.empty and '項目' in _bt.columns:
+                        _bt_chart = _bt.set_index('項目')[month_cols].T
+                        if not _bt_chart.empty and _bt_chart.sum().sum() > 0:
+                            st.markdown(f"**{ent} 秒數用途分列趨勢（1月～12月）**")
+                            st.area_chart(_bt_chart)
+                    
+                    # === 該實體的數字表格 ===
+                    _bt_month_cols = [c for c in _bt.columns if c != '項目']
+                    def _style_by_type_table(df_subset):
+                        _sub_month_cols = [c for c in _bt_month_cols if c in df_subset.columns]
+                        return df_subset.style.format({c: "{:.1f}" for c in _sub_month_cols}) if _sub_month_cols else df_subset.style
+                    st.markdown(f"**{ent} 秒數用途分列（1月～12月）**")
+                    _display_monthly_table_split(_bt, _bt_month_cols, style_func=_style_by_type_table, height=220, key_prefix=f"by_type_{ent}")
+                    
+                    summary_table = pd.DataFrame([
+                        block['used_row'],
+                        block['unused_row'],
+                        block['usage_rate_row'],
+                    ])
+                    _sum_month_cols = [c for c in summary_table.columns if c.endswith('月')]
+                    def _style_summary_table(df_subset):
+                        _sub_month_cols = [c for c in _sum_month_cols if c in df_subset.columns]
+                        # 複製 DataFrame 以便修改顯示值
+                        df_display = df_subset.copy()
+                        # 保留原始數值用於顏色判斷
+                        original_values = {}
+                        # 對於使用率行，將數值轉換為帶 % 的字串
+                        for idx, row in df_display.iterrows():
+                            row_name = str(row.get('項目', ''))
+                            original_values[idx] = {}
+                            if row_name.endswith('使用率'):
+                                for col in _sub_month_cols:
+                                    if col in df_display.columns:
+                                        val = row[col]
+                                        original_values[idx][col] = val  # 保留原始值
+                                        if isinstance(val, (int, float)) and not pd.isna(val):
+                                            df_display.at[idx, col] = f"{val:.1f}%"
+                            else:
+                                # 對於其他行（使用秒數、未使用秒數），保持數字格式
+                                for col in _sub_month_cols:
+                                    if col in df_display.columns:
+                                        val = row[col]
+                                        original_values[idx][col] = val  # 保留原始值
+                                        if isinstance(val, (int, float)) and not pd.isna(val):
+                                            df_display.at[idx, col] = f"{val:.1f}"
+                        # 套用顏色樣式（使用原始數值判斷）
+                        def _apply_color(row):
+                            row_name = str(row.get('項目', ''))
+                            idx = row.name
+                            colors = []
+                            for c in df_subset.columns:
+                                if row_name.endswith('使用率') and c.endswith('月'):
+                                    # 使用原始數值判斷顏色
+                                    orig_val = original_values.get(idx, {}).get(c, row.get(c))
+                                    colors.append(_style_pct_viz(orig_val))
+                                else:
+                                    colors.append('')
+                            return colors
+                        styled = df_display.style.apply(_apply_color, axis=1)
+                        return styled
+                    st.markdown(f"**{ent} 使用/未使用/使用率（1月～12月）**")
+                    _display_monthly_table_split(summary_table, _sum_month_cols, style_func=_style_summary_table, height=140, key_prefix=f"summary_{ent}")
+            
+            # PDF 和 Excel 下載按鈕
+            st.markdown("---")
+            st.markdown("#### 📥 下載報告")
+            col_pdf, col_excel = st.columns(2)
+            
+            with col_pdf:
+                pdf_bytes = _build_visualization_summary_pdf(annual_viz, summary_year_viz)
+                if pdf_bytes:
+                    st.download_button(
+                        label="📥 下載 PDF",
+                        data=pdf_bytes,
+                        file_name=f"總結表視覺化_{summary_year_viz}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                        mime="application/pdf",
+                        key="download_viz_pdf",
+                        use_container_width=True
+                    )
+                else:
+                    st.caption("PDF 生成失敗（可能缺少中文字型支援）")
+            
+            with col_excel:
+                excel_bytes = _build_visualization_summary_excel(annual_viz, summary_year_viz)
+                if excel_bytes:
+                    st.download_button(
+                        label="📥 下載 Excel",
+                        data=excel_bytes,
+                        file_name=f"總結表視覺化_{summary_year_viz}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="download_viz_excel",
+                        use_container_width=True
+                    )
+                else:
+                    st.caption("Excel 生成失敗")
+            
+            # 下載年度總結（Excel）
+            st.markdown("#### 📥 下載年度總結（Excel）")
             try:
                 from io import BytesIO
                 buf = BytesIO()
@@ -4197,13 +5246,16 @@ elif selected_tab == "📋 媒體秒數與採購":
         with st.spinner("正在產生模擬採購資料..."):
             ok, msg = generate_mock_platform_purchase_for_year(purchase_year)
             if ok:
+                # 清除所有相關的 session_state，確保輸入框會重新載入資料庫的值
                 to_del = [k for k in st.session_state if str(k).startswith("purchase_sec_") or str(k).startswith("purchase_price_")]
                 for k in to_del:
                     del st.session_state[k]
                 st.success(msg)
+                time.sleep(0.3)  # 短暫延遲確保資料庫寫入完成
                 st.rerun()
             else:
                 st.error(f"產生失敗：{msg}")
+    # 每次頁面載入時都重新從資料庫讀取最新資料
     existing = load_platform_monthly_purchase_all_media_for_year(purchase_year)
     import calendar
     for mp in MEDIA_PLATFORM_OPTIONS:
@@ -4216,20 +5268,27 @@ elif selected_tab == "📋 媒體秒數與採購":
             with cols[m - 1]:
                 st.markdown(f"**{m}月**")
                 sec, pr = data.get(m, (0, 0.0))
+                key_sec = f"purchase_sec_{mp}_{m}"
+                key_price = f"purchase_price_{mp}_{m}"
+                # 如果 session_state 中沒有該 key，使用資料庫的值；否則使用 session_state 的值（保留用戶輸入）
+                default_sec = int(sec) if sec else 0
+                default_price = float(pr) if pr else 0.0
+                # 當 session_state 中沒有值時，使用資料庫的值作為預設值
+                # 這樣當產生模擬資料後清除 session_state，輸入框會自動顯示新的資料庫值
                 inputs_sec[m] = st.number_input(
                     "購買秒數",
                     min_value=0,
-                    value=int(sec) if sec else 0,
+                    value=default_sec,
                     step=5000,
-                    key=f"purchase_sec_{mp}_{m}",
+                    key=key_sec,
                 )
                 inputs_price[m] = st.number_input(
                     "購買價格（元）",
                     min_value=0.0,
-                    value=float(pr) if pr else 0.0,
+                    value=default_price,
                     step=1000.0,
                     format="%.0f",
-                    key=f"purchase_price_{mp}_{m}",
+                    key=key_price,
                 )
         if st.button(f"儲存 {mp}", key=f"save_purchase_{mp}"):
             for m in range(1, 13):
