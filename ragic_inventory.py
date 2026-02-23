@@ -568,7 +568,7 @@ def sanitize_dataframe_for_display(df):
 
 
 def _styler_one_decimal(df):
-    """各分頁表格用：數值欄位顯示最多小數點第一位。回傳 Styler 供 st.dataframe 使用。"""
+    """各分頁表格用：數值欄位顯示最多小數點第一位，超過三位數時自動加千分位。回傳 Styler 供 st.dataframe 使用。"""
     if df is None:
         return None
     if df.empty:
@@ -576,7 +576,8 @@ def _styler_one_decimal(df):
     num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     if not num_cols:
         return df.style
-    return df.style.format({c: "{:.1f}" for c in num_cols})
+    # 使用 {:,.1f} 讓超過三位數的數字自動加千分位（如 1,234.5）
+    return df.style.format({c: "{:,.1f}" for c in num_cols})
 
 
 def _display_monthly_table_split(df, month_cols, style_func=None, height=None, key_prefix=""):
@@ -4187,7 +4188,7 @@ def _render_tab3(role_readonly=False):
                     sub = df_t3[fixed_cols_t3 + chunk]
                     st.caption(f"**{chunk[0]} ～ {chunk[-1]}**")
                     _num_cols_sub = sub.select_dtypes(include=[np.number]).columns.tolist()
-                    _fmt_sub = {c: "{:.1f}" for c in _num_cols_sub} if _num_cols_sub else {}
+                    _fmt_sub = {c: "{:,.1f}" for c in _num_cols_sub} if _num_cols_sub else {}
                     st.dataframe(sub.style.format(_fmt_sub).apply(lambda row: _style_chunk(row, chunk), axis=1), use_container_width=True)
 
                 # --- 點擊日期展開當日明細（可排日互動）---
@@ -4940,7 +4941,7 @@ elif selected_tab == "📉 總結表圖表":
                     _bt_month_cols = [c for c in _bt.columns if c != '項目']
                     def _style_by_type_table(df_subset):
                         _sub_month_cols = [c for c in _bt_month_cols if c in df_subset.columns]
-                        return df_subset.style.format({c: "{:.1f}" for c in _sub_month_cols}) if _sub_month_cols else df_subset.style
+                        return df_subset.style.format({c: "{:,.1f}" for c in _sub_month_cols}) if _sub_month_cols else df_subset.style
                     st.markdown(f"**{ent} 秒數用途分列（1月～12月）**")
                     _display_monthly_table_split(_bt, _bt_month_cols, style_func=_style_by_type_table, height=220, key_prefix=f"by_type_{ent}")
                     
@@ -4974,7 +4975,7 @@ elif selected_tab == "📉 總結表圖表":
                                         val = row[col]
                                         original_values[idx][col] = val  # 保留原始值
                                         if isinstance(val, (int, float)) and not pd.isna(val):
-                                            df_display.at[idx, col] = f"{val:.1f}"
+                                            df_display.at[idx, col] = f"{val:,.1f}"
                         # 套用顏色樣式（使用原始數值判斷）
                         def _apply_color(row):
                             row_name = str(row.get('項目', ''))
@@ -5132,7 +5133,7 @@ elif selected_tab == "📊 分公司×媒體 每月秒數":
                     B = int(240 - 133 * r)
                     out.append(f"background-color: rgb({R},{max(0,G)},{max(0,B)})")
                 return out
-            heatmap_styled = pivot_media_company.style.apply(_heatmap_row_style, axis=1).format("{:.0f}")
+            heatmap_styled = pivot_media_company.style.apply(_heatmap_row_style, axis=1).format("{:,.0f}")
             st.dataframe(heatmap_styled, use_container_width=True, height=min(320, 100 + len(pivot_media_company) * 38))
 
             st.markdown("---")
@@ -5155,7 +5156,7 @@ elif selected_tab == "📊 分公司×媒體 每月秒數":
             pct_display = pct_t.reset_index()
             def _balance_color(row):
                 return ["" if c == "公司" else _cell_balance_style(row.get(c)) for c in pct_display.columns]
-            st.dataframe(pct_display.style.format({c: "{:.1f}" for c in media_avail if c in pct_display.columns}).apply(_balance_color, axis=1), use_container_width=True, height=min(280, 80 + len(pct_display) * 36))
+            st.dataframe(pct_display.style.format({c: "{:,.1f}" for c in media_avail if c in pct_display.columns}).apply(_balance_color, axis=1), use_container_width=True, height=min(280, 80 + len(pct_display) * 36))
 
             st.markdown("---")
             st.markdown("#### ⑤ 年度 vs 月份趨勢 — 小 multiples 折線圖")
