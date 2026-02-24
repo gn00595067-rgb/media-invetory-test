@@ -4046,33 +4046,20 @@ custom_settings = load_platform_settings()
 # --- 側邊欄：控制區 ---
 st.sidebar.title("⚙️ 控制台")
 
-# 模擬資料：每次產出 200 筆 2026 年模擬資料供介面呈現
+# 模擬資料：一鍵產生訂單、容量、採購，供各分頁呈現（含表3 使用率、ROI 多樣性）
 st.sidebar.markdown("### 📊 資料來源")
-col_mock1, col_mock2 = st.sidebar.columns(2)
-with col_mock1:
-    if st.button("🎲 產生模擬資料", type="primary", help="隨機產生 200 筆 2026 年模擬訂單，供介面呈現使用", key="btn_mock_orders"):
-        with st.spinner("正在產生 200 筆 2026 年模擬資料..."):
-            success, msg = load_mock_data_to_db(n=200)
-            if success:
-                st.sidebar.success(msg)
-                time.sleep(0.5)
-                st.rerun()
-            else:
-                st.sidebar.error(f"產生失敗: {msg}")
-with col_mock2:
-    if st.button("🎯 資料+容量", type="secondary", help="產生模擬訂單並自動設定容量和採購資料，使使用率控制在 50-120%", key="btn_mock_with_capacity"):
-        with st.spinner("正在產生模擬資料、容量設定與採購資料..."):
-            success, msg = load_mock_data_with_capacity_to_db(n=200, year=2026)
-            if success:
-                # 清除「📋 媒體秒數與採購」頁面的 session_state，確保顯示最新資料
-                to_del = [k for k in st.session_state if str(k).startswith("purchase_sec_") or str(k).startswith("purchase_price_")]
-                for k in to_del:
-                    del st.session_state[k]
-                st.sidebar.success(msg)
-                time.sleep(0.5)
-                st.rerun()
-            else:
-                st.sidebar.error(f"產生失敗: {msg}")
+if st.sidebar.button("🎲 產生模擬資料", type="primary", help="產生 200 筆訂單＋容量＋採購，表3 使用率 50–120%、ROI 具正負多樣性", key="btn_mock_data"):
+    with st.spinner("正在產生模擬資料（訂單、容量、採購）..."):
+        success, msg = load_mock_data_with_capacity_to_db(n=200, year=2026)
+        if success:
+            to_del = [k for k in st.session_state if str(k).startswith("purchase_sec_") or str(k).startswith("purchase_price_")]
+            for k in to_del:
+                del st.session_state[k]
+            st.sidebar.success(msg)
+            time.sleep(0.5)
+            st.rerun()
+        else:
+            st.sidebar.error(f"產生失敗: {msg}")
 
 # 匯入 Google 試算表（表1結構）
 with st.sidebar.expander("📥 匯入 Google 試算表（表1結構）", expanded=False):
