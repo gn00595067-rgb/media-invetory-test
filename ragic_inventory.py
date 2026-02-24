@@ -324,16 +324,25 @@ def generate_mock_platform_purchase_for_year_with_capacity_check(year):
     """
     產生某年度、各媒體 1～12 月的模擬採購資料，但確保採購秒數 >= 實際使用秒數，
     避免覆蓋容量設定後導致使用率破千。
+    購買價格依各媒體各月實收金額加入隨機比例（約 40% 機率產生正 ROI），呈現狀態多樣性。
     回傳 (success: bool, message: str)
     """
     import calendar
     try:
-        # 先計算實際使用秒數
         conn = get_db_connection()
-        df_seg = pd.read_sql("SELECT * FROM ad_flight_segments WHERE media_platform IS NOT NULL", conn)
+        df_seg_full = pd.read_sql("SELECT * FROM ad_flight_segments WHERE media_platform IS NOT NULL", conn)
+        df_ord = pd.read_sql("SELECT id, split_amount FROM orders", conn)
         conn.close()
-        if not df_seg.empty:
-            df_daily = explode_segments_to_daily(df_seg)
+        usage_dict = {}
+        revenue_dict = {}  # mp -> { month -> 實收金額 }
+        if not df_seg_full.empty and not df_ord.empty:
+            df_seg = df_seg_full[['source_order_id', 'media_platform', 'start_date', 'end_date']].merge(
+                df_ord, left_on='source_order_id', right_on='id', how='left')
+            df_seg['split_amount'] = pd.to_numeric(df_seg['split_amount'], errors='coerce').fillna(0)
+            df_seg['start_date'] = pd.to_datetime(df_seg['start_date'], errors='coerce')
+            df_seg['end_date'] = pd.to_datetime(df_seg['end_date'], errors='coerce')
+            df_seg = df_seg.dropna(subset=['start_date', 'end_date'])
+            df_daily = explode_segments_to_daily(df_seg_full)
             if not df_daily.empty and '媒體平台' in df_daily.columns and '使用店秒' in df_daily.columns and '日期' in df_daily.columns:
                 df_daily['日期'] = pd.to_datetime(df_daily['日期'], errors='coerce')
                 df_daily = df_daily.dropna(subset=['日期'])
@@ -341,47 +350,58 @@ def generate_mock_platform_purchase_for_year_with_capacity_check(year):
                 df_daily['月'] = df_daily['日期'].dt.month
                 df_y = df_daily[df_daily['年'] == year]
                 if not df_y.empty:
-                    # 計算每個媒體平台每個月的實際使用秒數
                     usage_by_media_month = df_y.groupby(['媒體平台', '月'])['使用店秒'].sum().reset_index()
-                    usage_dict = {}
                     for _, row in usage_by_media_month.iterrows():
-                        mp = row['媒體平台']
-                        month = int(row['月'])
-                        used_sec = float(row['使用店秒'] or 0)
+                        mp, month = row['媒體平台'], int(row['月'])
                         if mp not in usage_dict:
                             usage_dict[mp] = {}
-                        usage_dict[mp][month] = used_sec
-        else:
-            usage_dict = {}
+                        usage_dict[mp][month] = float(row['使用店秒'] or 0)
+            # 依 segment 日期與月份重疊，按比例分配 split_amount 到各媒體各月
+            for _, seg in df_seg.iterrows():
+                mp = seg['media_platform']
+                amt = float(seg['split_amount'] or 0)
+                if amt <= 0:
+                    continue
+                s, e = seg['start_date'], seg['end_date']
+                total_days = max(1, (e - s).days + 1)
+                for m in range(1, 13):
+                    ms = pd.Timestamp(year, m, 1)
+                    _, nd = calendar.monthrange(year, m)
+                    me = pd.Timestamp(year, m, nd)
+                    overlap_start = max(s, ms)
+                    overlap_end = min(e, me)
+                    if overlap_start <= overlap_end:
+                        overlap_days = (overlap_end - overlap_start).days + 1
+                        prorate = amt * (overlap_days / total_days)
+                        if mp not in revenue_dict:
+                            revenue_dict[mp] = {}
+                        revenue_dict[mp][m] = revenue_dict[mp].get(m, 0) + prorate
         
-        # 各媒體基準：月購買秒數（店秒）、約略單價（元/秒）
         base_per_media = {
             '全家廣播(企頻)': (1_600_000, 2.0),
             '全家新鮮視': (1_300_000, 2.2),
             '家樂福超市': (900_000, 2.4),
             '家樂福量販店': (700_000, 2.1),
         }
-        
         for mp in MEDIA_PLATFORM_OPTIONS:
             base_sec, base_price_per_sec = base_per_media.get(mp, (1_000_000, 2.0))
             for m in range(1, 13):
-                # 計算基礎採購秒數
                 var = 0.92 + (hash((year, mp, m)) % 17) / 100.0
                 sec = int(base_sec * var)
                 sec = max(100_000, min(sec, 5_000_000))
-                
-                # 確保採購秒數 >= 實際使用秒數（至少是使用秒數的 1.2 倍，確保使用率不超過 120%）
                 if mp in usage_dict and m in usage_dict[mp]:
                     used_sec = usage_dict[mp][m]
-                    min_sec = int(used_sec * 1.2)  # 至少是使用秒數的 1.2 倍
+                    min_sec = int(used_sec * 1.2)
                     sec = max(sec, min_sec)
-                
-                price_per_sec = base_price_per_sec * (0.95 + (hash((year, mp, m + 10)) % 11) / 100.0)
-                price_per_sec = max(0.8, min(price_per_sec, 4.0))
-                price = int(sec * price_per_sec)
-                price = max(50_000, min(price, 15_000_000))
-                
-                # 只寫入採購資料，不覆蓋容量設定（容量已經根據使用率設定好了）
+                rev = revenue_dict.get(mp, {}).get(m, 0)
+                if rev > 0:
+                    # 隨機比例：約 40% 機率 購買成本 < 實收 → 正 ROI
+                    margin = random.uniform(-0.35, 0.55)
+                    price = max(10_000, int(rev * (1 + margin)))
+                else:
+                    price_per_sec = base_price_per_sec * (0.95 + (hash((year, mp, m + 10)) % 11) / 100.0)
+                    price_per_sec = max(0.8, min(price_per_sec, 4.0))
+                    price = max(50_000, min(int(sec * price_per_sec), 15_000_000))
                 conn = get_db_connection()
                 c = conn.cursor()
                 c.execute('''
@@ -390,8 +410,7 @@ def generate_mock_platform_purchase_for_year_with_capacity_check(year):
                 ''', (mp, int(year), int(m), int(sec), float(price)))
                 conn.commit()
                 conn.close()
-        
-        return True, f"已產生 {len(MEDIA_PLATFORM_OPTIONS)} 個媒體、{year} 年 1～12 月模擬採購資料（採購秒數已確保 >= 實際使用秒數）"
+        return True, f"已產生 {len(MEDIA_PLATFORM_OPTIONS)} 個媒體、{year} 年 1～12 月模擬採購資料（採購秒數已確保 >= 實際使用秒數；約 40% 機率正 ROI）"
     except Exception as e:
         return False, f"產生採購資料失敗：{e}"
 
@@ -2447,6 +2466,182 @@ def get_revenue_per_media_allocated_by_seconds():
         allocated = rev * (media_sec / total_sec)
         revenue_per_media[media_platform] = revenue_per_media.get(media_platform, 0) + allocated
     return {k: int(round(v)) for k, v in revenue_per_media.items()}
+
+
+def get_revenue_per_media_by_period(period_type, year, month=None):
+    """
+    依時間區間計算各媒體實收金額。
+    period_type: 'month' | 'quarter' | 'year' | 'all'
+    year, month: 指定參考年、月（month 用於 month/quarter 維度）
+    回傳 dict: media_platform -> 實收金額(int)
+    """
+    import calendar
+    try:
+        conn = get_db_connection()
+        df_ord = pd.read_sql("SELECT id, contract_id, amount_net, split_amount FROM orders", conn)
+        df_seg = pd.read_sql(
+            "SELECT source_order_id, media_platform, total_store_seconds, start_date, end_date FROM ad_flight_segments "
+            "WHERE media_platform IS NOT NULL AND total_store_seconds IS NOT NULL", conn
+        )
+        conn.close()
+    except Exception:
+        return {}
+    if df_ord.empty or df_seg.empty:
+        return {}
+    df_seg['start_date'] = pd.to_datetime(df_seg['start_date'], errors='coerce')
+    df_seg['end_date'] = pd.to_datetime(df_seg['end_date'], errors='coerce')
+    df_seg = df_seg.dropna(subset=['start_date', 'end_date'])
+    # 依 period_type 決定區間
+    if period_type == 'month' and month is not None:
+        _, ndays = calendar.monthrange(int(year), int(month))
+        period_start = pd.Timestamp(year, month, 1)
+        period_end = pd.Timestamp(year, month, ndays)
+    elif period_type == 'quarter' and month is not None:
+        q = (int(month) - 1) // 3 + 1
+        start_m = (q - 1) * 3 + 1
+        end_m = q * 3
+        period_start = pd.Timestamp(year, start_m, 1)
+        _, ndays = calendar.monthrange(year, end_m)
+        period_end = pd.Timestamp(year, end_m, ndays)
+    elif period_type == 'year':
+        period_start = pd.Timestamp(year, 1, 1)
+        period_end = pd.Timestamp(year, 12, 31)
+    else:
+        period_start = pd.Timestamp(2000, 1, 1)
+        period_end = pd.Timestamp(2100, 12, 31)
+    # 篩選與區間有重疊的 segment
+    mask = (df_seg['start_date'] <= period_end) & (df_seg['end_date'] >= period_start)
+    df_seg = df_seg[mask]
+    if df_seg.empty:
+        return {}
+    df_seg = df_seg.merge(df_ord, left_on='source_order_id', right_on='id', how='left')
+    df_seg['split_amount'] = pd.to_numeric(df_seg['split_amount'], errors='coerce').fillna(0)
+    use_split = (df_seg['split_amount'] > 0).any()
+    if use_split:
+        rev_by_media = df_seg.groupby('media_platform')['split_amount'].sum()
+        return {k: int(round(v)) for k, v in rev_by_media.items() if v and v > 0}
+    df_seg['contract_key'] = df_seg['contract_id'].fillna(df_seg['source_order_id'])
+    df_seg['amount_net'] = pd.to_numeric(df_seg['amount_net'], errors='coerce').fillna(0)
+    contract_total = df_ord.copy()
+    contract_total['contract_key'] = contract_total['contract_id'].fillna(contract_total['id'])
+    contract_total['amount_net'] = pd.to_numeric(contract_total['amount_net'], errors='coerce').fillna(0)
+    contract_total = contract_total.groupby('contract_key')['amount_net'].sum().to_dict()
+    seg_seconds = df_seg.groupby(['contract_key', 'media_platform'])['total_store_seconds'].sum().reset_index()
+    contract_seconds = df_seg.groupby('contract_key')['total_store_seconds'].sum().to_dict()
+    revenue_per_media = {}
+    for (contract_key, media_platform), grp in seg_seconds.groupby(['contract_key', 'media_platform']):
+        media_sec = int(grp['total_store_seconds'].sum())
+        total_sec = contract_seconds.get(contract_key, 0) or 1
+        rev = contract_total.get(contract_key, 0)
+        allocated = rev * (media_sec / total_sec)
+        revenue_per_media[media_platform] = revenue_per_media.get(media_platform, 0) + allocated
+    return {k: int(round(v)) for k, v in revenue_per_media.items()}
+
+
+def get_cost_per_media_by_period(period_type, year, month=None):
+    """
+    依時間區間彙總各媒體購買成本（秒數＋價格）。
+    period_type: 'month' | 'quarter' | 'year' | 'all'
+    回傳 dict: media_platform -> (purchased_seconds, purchase_cost)
+    """
+    import calendar
+    try:
+        conn = get_db_connection()
+        if period_type == 'all':
+            df = pd.read_sql(
+                "SELECT media_platform, purchased_seconds, purchase_price FROM platform_monthly_purchase", conn
+            )
+        else:
+            df = pd.read_sql(
+                "SELECT media_platform, year, month, purchased_seconds, purchase_price FROM platform_monthly_purchase WHERE year=?",
+                conn, params=(int(year),)
+            )
+        conn.close()
+    except Exception:
+        return {}
+    if df.empty:
+        return {}
+    df['purchased_seconds'] = pd.to_numeric(df['purchased_seconds'], errors='coerce').fillna(0)
+    df['purchase_price'] = pd.to_numeric(df['purchase_price'], errors='coerce').fillna(0)
+    if period_type == 'month' and month is not None:
+        df = df[df['month'] == int(month)]
+    elif period_type == 'quarter' and month is not None:
+        q = (int(month) - 1) // 3 + 1
+        start_m, end_m = (q - 1) * 3 + 1, q * 3
+        df = df[(df['month'] >= start_m) & (df['month'] <= end_m)]
+    elif period_type == 'year':
+        pass
+    elif period_type == 'all':
+        pass
+    else:
+        return {}
+    out = df.groupby('media_platform').agg({'purchased_seconds': 'sum', 'purchase_price': 'sum'}).to_dict('index')
+    return {k: (int(v['purchased_seconds']), float(v['purchase_price'])) for k, v in out.items()}
+
+
+def _get_roi_all_period_date_range():
+    """
+    取得「累計至今」的實際統計日期範圍。
+    回傳 (start_str, end_str) 如 ("2024/1/1", "2026/12/31")，無資料則回傳 (None, None)
+    """
+    try:
+        conn = get_db_connection()
+        # 採購資料：year, month
+        df_pur = pd.read_sql("SELECT year, month FROM platform_monthly_purchase", conn)
+        df_seg = pd.read_sql("SELECT start_date, end_date FROM ad_flight_segments WHERE start_date IS NOT NULL AND end_date IS NOT NULL", conn)
+        conn.close()
+        dates = []
+        if not df_pur.empty:
+            for _, r in df_pur.iterrows():
+                try:
+                    dates.append(pd.Timestamp(int(r['year']), int(r['month']), 1))
+                    _, nd = calendar.monthrange(int(r['year']), int(r['month']))
+                    dates.append(pd.Timestamp(int(r['year']), int(r['month']), nd))
+                except Exception:
+                    pass
+        if not df_seg.empty:
+            df_seg['start_date'] = pd.to_datetime(df_seg['start_date'], errors='coerce')
+            df_seg['end_date'] = pd.to_datetime(df_seg['end_date'], errors='coerce')
+            dates.extend(df_seg['start_date'].dropna().tolist())
+            dates.extend(df_seg['end_date'].dropna().tolist())
+        if not dates:
+            return None, None
+        start_d = min(dates)
+        end_d = max(dates)
+        return start_d.strftime("%Y/%m/%d"), end_d.strftime("%Y/%m/%d")
+    except Exception:
+        return None, None
+
+
+def _calculate_roi_by_period(period_type, year, month, period_label):
+    """
+    依時間維度計算各媒體 ROI。
+    period_type: 'month' | 'quarter' | 'year' | 'all'
+    period_label: 顯示用標籤，如 "2026年1月"、"2026 Q1"、"2026年"、"累計至今"
+    回傳 list of dict
+    """
+    revenue_per_media = get_revenue_per_media_by_period(period_type, year, month)
+    cost_per_media = get_cost_per_media_by_period(period_type, year, month)
+    media_set = set(MEDIA_PLATFORM_OPTIONS)
+    media_set.update(revenue_per_media.keys())
+    media_set.update(cost_per_media.keys())
+    rows = []
+    for mp in sorted(media_set):
+        cost_row = cost_per_media.get(mp)
+        if cost_row is None or not cost_row[0] or cost_row[0] <= 0:
+            continue
+        purchased_sec, purchase_cost = cost_row[0], cost_row[1]
+        revenue = int(revenue_per_media.get(mp, 0) or 0)
+        roi = ((revenue - purchase_cost) / purchase_cost) if purchase_cost > 0 else 0
+        rows.append({
+            "媒體": mp,
+            "時間區間": period_label,
+            "購買秒數": int(purchased_sec),
+            "購買成本（元）": round(purchase_cost, 0),
+            "實收金額（元）": revenue,
+            "ROI（投報率）": round(roi, 2),
+        })
+    return rows
 
 
 def _calculate_roi_from_actual_data(year, month, revenue_per_media):
@@ -5471,47 +5666,102 @@ elif selected_tab == "🧪 實驗分頁":
 
 elif selected_tab == "📊 ROI":
     st.markdown("### 📊 ROI 投報分析")
-    st.caption("依現有採購與訂單資料計算各媒體之投報率，不涉及模擬或預測。")
+    st.caption("依現有採購與訂單資料計算各媒體之投報率，支援多時間維度檢視。")
 
-    st.markdown("---")
-    st.markdown("#### 資料來源說明")
-    st.markdown("""
+    with st.expander("📖 資料來源說明", expanded=False):
+        st.markdown("""
 | 項目 | 來源 |
 |------|------|
-| **購買成本** | 「📋 媒體秒數與採購」分頁的該年該月購買價格 |
-| **實收金額** | 表1 訂單；同一合約多媒體時依各媒體使用秒數比例拆分，或使用拆分金額 |
+| **購買成本** | 「📋 媒體秒數與採購」分頁的購買價格，依選定時間維度彙總 |
+| **實收金額** | 表1 訂單；依檔次段日期與選定區間重疊者計算，同一合約多媒體時依秒數比例或拆分金額分配 |
 | **ROI** | (實收 - 購買成本) ÷ 購買成本 |
 """)
-    st.markdown("---")
 
-    roi_year = st.number_input("參考年度", min_value=2020, max_value=2030, value=datetime.now().year, key="roi_year")
-    roi_month = st.number_input("參考月份", min_value=1, max_value=12, value=datetime.now().month, key="roi_month")
+    # 時間維度選擇
+    roi_time_dim = st.radio(
+        "時間維度",
+        options=["month", "quarter", "year", "all"],
+        format_func=lambda x: {"month": "📅 單月", "quarter": "📊 單季", "year": "📆 單年", "all": "🔄 累計至今"}[x],
+        horizontal=True,
+        key="roi_time_dim",
+    )
+    roi_year = datetime.now().year
+    roi_month = 1
+    roi_quarter = 1
+    if roi_time_dim == "month":
+        c1, c2 = st.columns(2)
+        with c1:
+            roi_year = st.number_input("參考年度", min_value=2020, max_value=2030, value=datetime.now().year, key="roi_year")
+        with c2:
+            roi_month = st.number_input("參考月份", min_value=1, max_value=12, value=datetime.now().month, key="roi_month")
+        period_label = f"{roi_year}年{roi_month}月"
+    elif roi_time_dim == "quarter":
+        c1, c2 = st.columns(2)
+        with c1:
+            roi_year = st.number_input("參考年度", min_value=2020, max_value=2030, value=datetime.now().year, key="roi_year")
+        with c2:
+            roi_quarter = st.selectbox("參考季度", options=[1, 2, 3, 4], format_func=lambda x: f"Q{x}（{'1-3月' if x==1 else '4-6月' if x==2 else '7-9月' if x==3 else '10-12月'}）", key="roi_quarter")
+        roi_month = (roi_quarter - 1) * 3 + 1
+        period_label = f"{roi_year} Q{roi_quarter}"
+    elif roi_time_dim == "year":
+        roi_year = st.number_input("參考年度", min_value=2020, max_value=2030, value=datetime.now().year, key="roi_year")
+        period_label = f"{roi_year}年"
+    else:
+        st.caption("將彙總所有採購與訂單資料，無需選擇年度或月份。")
+        period_label = "累計至今"
 
-    revenue_per_media = get_revenue_per_media_allocated_by_seconds()
-    if not revenue_per_media:
-        st.info("尚無訂單或檔次段資料，實收金額將為 0。請先於表1 建立訂單並產生檔次段。")
-        revenue_per_media = {}
-
-    roi_rows = _calculate_roi_from_actual_data(roi_year, roi_month, revenue_per_media)
+    roi_rows = _calculate_roi_by_period(roi_time_dim, roi_year, roi_month if roi_time_dim in ("month", "quarter") else 1, period_label)
 
     if not roi_rows:
-        st.warning("尚無採購資料。請至「📋 媒體秒數與採購」分頁輸入該年該月的購買秒數與購買價格。")
+        st.warning("尚無採購資料或該區間無資料。請至「📋 媒體秒數與採購」分頁輸入購買秒數與購買價格。")
     else:
         roi_df = pd.DataFrame(roi_rows)
-        st.markdown("#### 媒體別 ROI 表")
-        st.dataframe(_styler_one_decimal(roi_df), use_container_width=True, height=min(220, 80 + len(roi_rows) * 42))
+        display_label = period_label
+        if period_label == "累計至今":
+            range_start, range_end = _get_roi_all_period_date_range()
+            if range_start and range_end:
+                display_label = f"累計至今（{range_start} ～ {range_end}）"
+        st.markdown(f"#### 媒體別 ROI 表 — {display_label}")
 
-        st.markdown("#### ROI 視覺化")
+        # ROI 長條圖（依 ROI 正負上色）
         try:
             import altair as alt
-            roi_chart_df = roi_df[["媒體", "ROI（投報率）"]].copy()
+            roi_chart_df = roi_df.copy()
+            roi_chart_df["ROI色彩"] = roi_chart_df["ROI（投報率）"].apply(lambda x: "正報酬" if x >= 0 else "負報酬")
             chart_roi = alt.Chart(roi_chart_df).mark_bar(size=38).encode(
-                x=alt.X("媒體:N", title="媒體"),
-                y=alt.Y("ROI（投報率）:Q", title="ROI"),
-                tooltip=["媒體", alt.Tooltip("ROI（投報率）:Q", format=".1f")]
-            ).properties(width=700, height=400)
+                x=alt.X("媒體:N", title="媒體", sort="-y"),
+                y=alt.Y("ROI（投報率）:Q", title="ROI（投報率）", axis=alt.Axis(format="%")),
+                color=alt.Color("ROI色彩:N", scale=alt.Scale(domain=["正報酬", "負報酬"], range=["#27ae60", "#e74c3c"]), legend=None),
+                tooltip=[
+                    alt.Tooltip("媒體:N", title="媒體"),
+                    alt.Tooltip("ROI（投報率）:Q", format=".2%", title="ROI"),
+                    alt.Tooltip("實收金額（元）:Q", format=",.0f"),
+                    alt.Tooltip("購買成本（元）:Q", format=",.0f"),
+                ]
+            ).properties(width=700, height=350).configure_axisY(format="%")
             st.altair_chart(chart_roi, use_container_width=True)
-        except ImportError:
+        except Exception:
             st.bar_chart(roi_df.set_index("媒體")["ROI（投報率）"])
+
+        st.dataframe(_styler_one_decimal(roi_df.drop(columns=["時間區間"], errors="ignore")), use_container_width=True, height=min(200, 60 + len(roi_rows) * 38))
+
+        # 多維度一鍵比較（設計巧思）
+        st.markdown("---")
+        st.markdown("#### 🔀 多維度比較")
+        st.caption("一次檢視「當月、當季、當年、累計」四種維度的 ROI，快速掌握各媒體在不同時間尺度下的表現。")
+        if st.checkbox("顯示多維度比較表", value=False, key="roi_multi_compare"):
+            all_rows = []
+            for pt, pl in [("month", f"{roi_year}年{roi_month}月"), ("quarter", f"{roi_year} Q{(roi_month-1)//3+1}"), ("year", f"{roi_year}年"), ("all", "累計至今")]:
+                r = _calculate_roi_by_period(pt, roi_year, roi_month if pt in ("month", "quarter") else 1, pl)
+                for row in r:
+                    row["時間區間"] = pl
+                    all_rows.append(row)
+            if all_rows:
+                multi_df = pd.DataFrame(all_rows)
+                # 樞紐：列=媒體，欄=時間區間，值=ROI
+                pivot_roi = multi_df.pivot_table(index="媒體", columns="時間區間", values="ROI（投報率）", aggfunc="first")
+                order_cols = [f"{roi_year}年{roi_month}月", f"{roi_year} Q{(roi_month-1)//3+1}", f"{roi_year}年", "累計至今"]
+                pivot_roi = pivot_roi.reindex(columns=[c for c in order_cols if c in pivot_roi.columns])
+                st.dataframe(pivot_roi.style.format("{:.2%}"), use_container_width=True)
 
 # （檔次稽核、檔次拆解表 已移除）
