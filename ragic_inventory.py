@@ -618,6 +618,18 @@ def get_media_platform_display(platform, channel, raw_platform=''):
         return '家樂福量販店' if '量販' in raw else '家樂福超市'
     return '其他'
 
+
+def should_multiply_store_count(media_platform: str) -> bool:
+    """
+    使用秒數計算規則（重要）：
+    - 全家廣播(企頻)、全家新鮮視：使用店秒 = 檔次 × 秒數 × 店數
+    - 其他（如 家樂福超市/量販店、診所/門診等）：使用秒數 = 檔次 × 秒數（不乘店數）
+
+    注意：系統內部仍沿用欄名「使用店秒」，但在不乘店數的平台其意義等同「使用秒數」。
+    """
+    mp = (media_platform or '').strip()
+    return mp in ('全家廣播(企頻)', '全家新鮮視')
+
 def get_store_count(platform, custom_settings=None):
     """取得平台店數（優先使用自訂設定，其次平台鍵，再依區域對照，最後預設 1）"""
     if custom_settings and platform in custom_settings:
@@ -1682,7 +1694,12 @@ def build_table1_from_cue_excel(cue_data_list, custom_settings=None):
     for ad_unit in cue_data_list:
         # 計算店數
         platform_display = ad_unit.get('platform', '未知')
-        store_count = get_store_count(platform_display, custom_settings)
+        try:
+            p, ch, _ = parse_platform_region(platform_display)
+            mp = get_media_platform_display(p, ch, platform_display)
+        except Exception:
+            mp = '其他'
+        store_count = get_store_count(platform_display, custom_settings) if should_multiply_store_count(mp) else 1
         
         # 計算統計欄位
         daily_spots = ad_unit.get('daily_spots', [])
@@ -2197,10 +2214,12 @@ def calculate_inventory(df_orders=None, custom_settings=None, use_segments=True)
                 if pd.isna(s_date) or pd.isna(e_date):
                     continue
                 
-                # 取得該平台的店數
-                store_count = get_store_count(row['platform'], custom_settings)
+                # 依媒體平台決定是否乘店數（避免家樂福/診所等被乘上店數）
+                p, ch, _ = parse_platform_region(row.get('platform'))
+                mp = get_media_platform_display(p, ch, row.get('platform', ''))
+                store_count = get_store_count(row['platform'], custom_settings) if should_multiply_store_count(mp) else 1
                 
-                # 計算每日消耗 (秒數 * 檔次 * 店數)
+                # 計算每日消耗：全家類為「使用店秒」，其餘為「使用秒數」（仍沿用欄名使用店秒）
                 daily_usage_store_seconds = row['seconds'] * row['spots'] * store_count
                 daily_usage_raw_seconds = row['seconds'] * row['spots']
                 
@@ -2278,8 +2297,8 @@ def build_ad_flight_segments(df_orders, custom_settings=None, write_to_db=True):
                 if pd.isna(s_date) or pd.isna(e_date):
                     continue
                 
-                # 計算相關數值
-                store_count = get_store_count(row['platform'], custom_settings)
+                # 計算相關數值（僅全家廣播/新鮮視乘店數；其餘媒體不乘店數）
+                store_count = get_store_count(row['platform'], custom_settings) if should_multiply_store_count(media_platform) else 1
                 days = (e_date - s_date).days + 1
                 total_spots = row['spots'] * days
                 total_store_seconds = row['seconds'] * total_spots * store_count
