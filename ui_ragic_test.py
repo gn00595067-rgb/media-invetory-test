@@ -12,6 +12,7 @@ from ragic_client import (
     extract_entries,
     get_json,
     make_listing_url,
+    make_single_record_url,
     parse_file_tokens,
     parse_sheet_url,
 )
@@ -226,9 +227,25 @@ def render_ragic_test_tab(
             st.stop()
 
         sel_id = st.selectbox("選擇 _ragicId", options=ids)
-        entry = next((e for e in entries if int(e.get("_ragicId", -1)) == int(sel_id)), None)
-        if not entry:
-            st.warning("找不到該筆 entry。")
+        # listing 有時不含檔案欄位，改抓單筆 entry 取得完整欄位（含附件/子表）
+        single_url = make_single_record_url(ref, sel_id)
+        _log(f"single record url={single_url}")
+        single_payload, single_err = get_json(single_url, api_key, timeout=60)
+        if single_err or not isinstance(single_payload, dict):
+            _log(f"single record 失敗：{single_err}")
+            # fallback：用 listing entry
+            entry = next((e for e in entries if int(e.get("_ragicId", -1)) == int(sel_id)), None)
+        else:
+            # 單筆回傳通常是 {"<rid>": {...}} 或直接 {...}
+            if str(sel_id) in single_payload and isinstance(single_payload.get(str(sel_id)), dict):
+                entry = single_payload.get(str(sel_id))
+            else:
+                entry = single_payload
+            if isinstance(entry, dict) and not entry.get("_ragicId"):
+                entry["_ragicId"] = int(sel_id)
+
+        if not entry or not isinstance(entry, dict):
+            st.warning("找不到該筆 entry（單筆/列表皆失敗）。")
             st.stop()
 
         show_fields = [
@@ -253,16 +270,20 @@ def render_ragic_test_tab(
         cue_fid = ragic_fields.get("訂檔CUE表")
         cue_val = entry.get(cue_fid) if cue_fid and cue_fid in entry else entry.get("訂檔CUE表")
         cue_tokens = parse_file_tokens(cue_val)
+        # 只解析 Excel；若只有 JPG/PDF，先提示
+        excel_tokens = [t for t in cue_tokens if str(t).lower().endswith((".xlsx", ".xls"))]
         if not cue_tokens:
             st.info("此筆沒有「訂檔CUE表」檔案。")
         else:
             st.markdown(f"**訂檔CUE表檔案數：{len(cue_tokens)}**")
             for i, tok in enumerate(cue_tokens, start=1):
                 st.markdown(f"- 檔案{i}：`{tok}`")
+            if not excel_tokens:
+                st.warning("此筆「訂檔CUE表」沒有 Excel（.xlsx/.xls）。目前抓到的檔案可能是 JPG/PDF（例如報價單），因此不會進行 CUE 解析。")
 
             parse_now = st.checkbox("立即下載並解析 CUE Excel", value=True)
-            if parse_now:
-                for i, tok in enumerate(cue_tokens, start=1):
+            if parse_now and excel_tokens:
+                for i, tok in enumerate(excel_tokens, start=1):
                     with st.expander(f"解析 檔案{i}"):
                         content, derr = download_file(ref, tok, api_key, timeout=120)
                         if derr:
