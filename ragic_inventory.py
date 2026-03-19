@@ -479,131 +479,6 @@ def load_platform_monthly_purchase_all_media_for_year(year):
     return out
 
 
-def generate_mock_platform_purchase_for_year(year):
-    """
-    產生某年度、各媒體 1～12 月的模擬採購資料（購買秒數與購買價格），數值合理、不爆量。
-    會寫入 platform_monthly_purchase 並同步 platform_monthly_capacity。
-    回傳 (success: bool, message: str)
-    """
-    import calendar
-    # 各媒體基準：月購買秒數（店秒）、約略單價（元/秒），依月份 ±10% 變化
-    base_per_media = {
-        '全家廣播(企頻)': (1_600_000, 2.0),
-        '全家新鮮視': (1_300_000, 2.2),
-        '家樂福超市': (900_000, 2.4),
-        '家樂福量販店': (700_000, 2.1),
-    }
-    try:
-        for mp in MEDIA_PLATFORM_OPTIONS:
-            base_sec, base_price_per_sec = base_per_media.get(mp, (1_000_000, 2.0))
-            for m in range(1, 13):
-                # 依月份略變：約 0.92～1.08 倍，讓每月不同但穩定
-                var = 0.92 + (hash((year, mp, m)) % 17) / 100.0
-                sec = int(base_sec * var)
-                sec = max(100_000, min(sec, 5_000_000))
-                price_per_sec = base_price_per_sec * (0.95 + (hash((year, mp, m + 10)) % 11) / 100.0)
-                price_per_sec = max(0.8, min(price_per_sec, 4.0))
-                price = int(sec * price_per_sec)
-                price = max(50_000, min(price, 15_000_000))
-                set_platform_monthly_purchase(mp, year, m, sec, price)
-        return True, f"已產生 {len(MEDIA_PLATFORM_OPTIONS)} 個媒體、{year} 年 1～12 月模擬採購資料（已寫入並同步表3 每日可用秒數）"
-    except Exception as e:
-        return False, str(e)
-
-def generate_mock_platform_purchase_for_year_with_capacity_check(year):
-    """
-    產生某年度、各媒體 1～12 月的模擬採購資料，但確保採購秒數 >= 實際使用秒數，
-    避免覆蓋容量設定後導致使用率破千。
-    購買價格依各媒體各月實收金額加入隨機比例（約 40% 機率產生正 ROI），呈現狀態多樣性。
-    回傳 (success: bool, message: str)
-    """
-    import calendar
-    try:
-        conn = get_db_connection()
-        df_seg_full = pd.read_sql("SELECT * FROM ad_flight_segments WHERE media_platform IS NOT NULL", conn)
-        df_ord = pd.read_sql("SELECT id, split_amount FROM orders", conn)
-        conn.close()
-        usage_dict = {}
-        revenue_dict = {}  # mp -> { month -> 實收金額 }
-        if not df_seg_full.empty and not df_ord.empty:
-            df_seg = df_seg_full[['source_order_id', 'media_platform', 'start_date', 'end_date']].merge(
-                df_ord, left_on='source_order_id', right_on='id', how='left')
-            df_seg['split_amount'] = pd.to_numeric(df_seg['split_amount'], errors='coerce').fillna(0)
-            df_seg['start_date'] = pd.to_datetime(df_seg['start_date'], errors='coerce')
-            df_seg['end_date'] = pd.to_datetime(df_seg['end_date'], errors='coerce')
-            df_seg = df_seg.dropna(subset=['start_date', 'end_date'])
-            df_daily = explode_segments_to_daily(df_seg_full)
-            if not df_daily.empty and '媒體平台' in df_daily.columns and '使用店秒' in df_daily.columns and '日期' in df_daily.columns:
-                df_daily['日期'] = pd.to_datetime(df_daily['日期'], errors='coerce')
-                df_daily = df_daily.dropna(subset=['日期'])
-                df_daily['年'] = df_daily['日期'].dt.year
-                df_daily['月'] = df_daily['日期'].dt.month
-                df_y = df_daily[df_daily['年'] == year]
-                if not df_y.empty:
-                    usage_by_media_month = df_y.groupby(['媒體平台', '月'])['使用店秒'].sum().reset_index()
-                    for _, row in usage_by_media_month.iterrows():
-                        mp, month = row['媒體平台'], int(row['月'])
-                        if mp not in usage_dict:
-                            usage_dict[mp] = {}
-                        usage_dict[mp][month] = float(row['使用店秒'] or 0)
-            # 依 segment 日期與月份重疊，按比例分配 split_amount 到各媒體各月
-            for _, seg in df_seg.iterrows():
-                mp = seg['media_platform']
-                amt = float(seg['split_amount'] or 0)
-                if amt <= 0:
-                    continue
-                s, e = seg['start_date'], seg['end_date']
-                total_days = max(1, (e - s).days + 1)
-                for m in range(1, 13):
-                    ms = pd.Timestamp(year, m, 1)
-                    _, nd = calendar.monthrange(year, m)
-                    me = pd.Timestamp(year, m, nd)
-                    overlap_start = max(s, ms)
-                    overlap_end = min(e, me)
-                    if overlap_start <= overlap_end:
-                        overlap_days = (overlap_end - overlap_start).days + 1
-                        prorate = amt * (overlap_days / total_days)
-                        if mp not in revenue_dict:
-                            revenue_dict[mp] = {}
-                        revenue_dict[mp][m] = revenue_dict[mp].get(m, 0) + prorate
-        
-        base_per_media = {
-            '全家廣播(企頻)': (1_600_000, 2.0),
-            '全家新鮮視': (1_300_000, 2.2),
-            '家樂福超市': (900_000, 2.4),
-            '家樂福量販店': (700_000, 2.1),
-        }
-        for mp in MEDIA_PLATFORM_OPTIONS:
-            base_sec, base_price_per_sec = base_per_media.get(mp, (1_000_000, 2.0))
-            for m in range(1, 13):
-                var = 0.92 + (hash((year, mp, m)) % 17) / 100.0
-                sec = int(base_sec * var)
-                sec = max(100_000, min(sec, 5_000_000))
-                if mp in usage_dict and m in usage_dict[mp]:
-                    used_sec = usage_dict[mp][m]
-                    min_sec = int(used_sec * 1.2)
-                    sec = max(sec, min_sec)
-                rev = revenue_dict.get(mp, {}).get(m, 0)
-                if rev > 0:
-                    # 隨機比例：約 40% 機率 購買成本 < 實收 → 正 ROI
-                    margin = random.uniform(-0.35, 0.55)
-                    price = max(10_000, int(rev * (1 + margin)))
-                else:
-                    price_per_sec = base_price_per_sec * (0.95 + (hash((year, mp, m + 10)) % 11) / 100.0)
-                    price_per_sec = max(0.8, min(price_per_sec, 4.0))
-                    price = max(50_000, min(int(sec * price_per_sec), 15_000_000))
-                conn = get_db_connection()
-                c = conn.cursor()
-                c.execute('''
-                    INSERT OR REPLACE INTO platform_monthly_purchase (media_platform, year, month, purchased_seconds, purchase_price)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (mp, int(year), int(m), int(sec), float(price)))
-                conn.commit()
-                conn.close()
-        return True, f"已產生 {len(MEDIA_PLATFORM_OPTIONS)} 個媒體、{year} 年 1～12 月模擬採購資料（採購秒數已確保 >= 實際使用秒數；約 40% 機率正 ROI）"
-    except Exception as e:
-        return False, f"產生採購資料失敗：{e}"
-
 def load_platform_settings():
     """從資料庫載入平台設定（優先使用資料庫中的設定）"""
     conn = get_db_connection()
@@ -2122,11 +1997,7 @@ def build_table1_from_cue_excel(cue_data_list, custom_settings=None):
     
     return df_table1
 
-# ==========================================
-# 模擬資料產生（2026 年，供介面呈現）
-# ==========================================
-
-# 模擬用常數（對齊 Cue 表規格）
+# 常數（訂單 CRUD、匯入與總結表用，對齊 Cue 表規格）
 MOCK_REGIONS = ["北區", "桃竹苗", "中區", "雲嘉南", "高屏", "東區", "全省"]
 MOCK_PLATFORM_RAW = [
     "新鮮視全省", "新鮮視北北基", "新鮮視中彰投", "新鮮視桃竹苗", "新鮮視雲嘉南", "新鮮視高高屏", "新鮮視宜花東",
@@ -2156,165 +2027,6 @@ def _normalize_seconds_type(val):
     if s in SECONDS_USAGE_TYPES:
         return s
     return SECONDS_TYPE_ALIASES.get(s, '銷售秒數')
-
-def generate_mock_orders_2026(n=200):
-    """
-    產生 2026 年模擬訂單，模擬「一份合約因多平台/多區域/多秒數/多檔次而拆成多列」的真實情境。
-    先產生若干「合約」，每份合約再拆成多筆訂單列（不同平台、區域、秒數、檔次、秒數用途），總筆數約 n。
-    同一合約內可有多種秒數用途；未拆分的一列只會有一種類型。
-    模擬「專案實收金額」（同一合約同值），實收金額不模擬（填 0）。
-    回傳 list of tuples:
-    (id, platform, client, product, sales, company, start_date, end_date, seconds, spots, amount_net=0, updated_at, contract_id, seconds_type, project_amount_net)
-    """
-    random.seed()
-    orders = []
-    base_date = datetime(2026, 1, 1)
-    updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # 合約數：約 n/8 份合約，每份合約 4~15 列（不同媒體/區域/秒數/檔次）
-    n_contracts = max(15, min(40, n // 8))
-    row_count = 0
-    for c in range(n_contracts):
-        contract_id = f"mock_{2026}_c{c+1:03d}"
-        client = random.choice(MOCK_CLIENTS)
-        product = random.choice(MOCK_PRODUCTS)
-        sales = random.choice(MOCK_SALES)
-        company = random.choice(MOCK_COMPANY)
-        # 同一合約共用同一檔期（可略為錯開模擬不同檔次時段）
-        start_offset = random.randint(0, 300)
-        duration_days = random.randint(14, min(31, 365 - start_offset))
-        start_dt = base_date + timedelta(days=start_offset)
-        end_dt = start_dt + timedelta(days=duration_days - 1)
-        if end_dt.year > 2026 or end_dt.month > 12:
-            end_dt = datetime(2026, 12, 31)
-        start_date = start_dt.strftime("%Y-%m-%d")
-        end_date = end_dt.strftime("%Y-%m-%d")
-        # 每份合約拆成多列（剩餘筆數少時可 1~3 列，避免 randint 空範圍）
-        remaining = n - row_count
-        if remaining <= 0:
-            break
-        low_rows = max(1, min(4, remaining))
-        high_rows = min(15, remaining)
-        n_rows = random.randint(low_rows, high_rows)
-        # 專案實收金額：同一合約一筆總額，每列都填同一數字；實收金額不模擬（0）
-        project_amount_net = max(120000, random.randint(120, 400) * 1000 * n_rows)
-        for r in range(n_rows):
-            if row_count >= n:
-                break
-            uid = f"mock_{2026}_c{c+1:03d}_{r+1:02d}"
-            platform = random.choice(MOCK_PLATFORM_RAW)
-            seconds = random.choice(MOCK_SECONDS)
-            spots = random.randint(2, 36)
-            if spots % 2 != 0:
-                spots += 1
-            seconds_type = random.choice(SECONDS_USAGE_TYPES)  # 同一合約內每列可不同類型
-            orders.append((uid, platform, client, product, sales, company, start_date, end_date, seconds, spots, 0, updated_at, contract_id, seconds_type, project_amount_net))
-            row_count += 1
-        if row_count >= n:
-            break
-    return orders
-
-def generate_mock_capacity_for_year(year=2026, target_usage_min=50, target_usage_max=120):
-    """
-    根據已產生的檔次段，計算每個媒體平台每個月的使用秒數，然後設定容量使使用率控制在 target_usage_min ~ target_usage_max %。
-    回傳 (success: bool, message: str)
-    """
-    try:
-        import calendar
-        # 從 DB 讀取 segments 並展開為每日資料
-        conn = get_db_connection()
-        df_seg = pd.read_sql("SELECT * FROM ad_flight_segments WHERE media_platform IS NOT NULL", conn)
-        conn.close()
-        if df_seg.empty:
-            return False, "尚無檔次段資料，請先產生模擬訂單"
-        df_daily = explode_segments_to_daily(df_seg)
-        if df_daily.empty or '媒體平台' not in df_daily.columns or '使用店秒' not in df_daily.columns or '日期' not in df_daily.columns:
-            return False, "無法從檔次段展開每日資料"
-        df_daily['日期'] = pd.to_datetime(df_daily['日期'], errors='coerce')
-        df_daily = df_daily.dropna(subset=['日期'])
-        df_daily['年'] = df_daily['日期'].dt.year
-        df_daily['月'] = df_daily['日期'].dt.month
-        df_y = df_daily[df_daily['年'] == year]
-        if df_y.empty:
-            return False, f"{year} 年尚無每日資料"
-        # 計算每個媒體平台、每個月的使用秒數總和
-        usage_by_media_month = df_y.groupby(['媒體平台', '月'])['使用店秒'].sum().reset_index()
-        # 設定容量：目標使用率 50-120%，容量 = 使用秒數 / 目標使用率
-        capacity_set = set()
-        for _, row in usage_by_media_month.iterrows():
-            mp = row['媒體平台']
-            month = int(row['月'])
-            used_sec = float(row['使用店秒'] or 0)
-            if used_sec <= 0 or pd.isna(mp):
-                continue
-            target_rate = random.uniform(target_usage_min / 100, target_usage_max / 100)
-            monthly_cap = used_sec / target_rate
-            ndays = calendar.monthrange(year, month)[1]
-            daily_cap = max(1, int(monthly_cap / ndays)) if ndays > 0 else max(1, int(monthly_cap / 30))
-            set_platform_monthly_capacity(mp, year, month, daily_cap)
-            capacity_set.add((mp, month))
-        return True, f"已設定 {len(capacity_set)} 筆容量（{year} 年，使用率控制在 {target_usage_min}%-{target_usage_max}%）"
-    except Exception as e:
-        return False, f"產生容量設定失敗：{e}"
-
-
-def load_mock_data_to_db(n=200):
-    """
-    產生 n 筆 2026 模擬資料並寫入 orders，同時建立 ad_flight_segments。
-    模擬專案實收金額（同一合約同值），實收金額不模擬（0）；寫入後依比例自動計算拆分金額。
-    回傳 (success: bool, message: str)
-    """
-    init_db()
-    orders = generate_mock_orders_2026(n=n)
-    conn = get_db_connection()
-    c = conn.cursor()
-    try:
-        c.execute("BEGIN TRANSACTION")
-        c.execute("DELETE FROM orders")
-        # t = (id, platform, ..., amount_net=0, updated_at, contract_id, seconds_type, project_amount_net)；拆分金額先 NULL，稍後計算
-        c.executemany("""
-            INSERT OR REPLACE INTO orders
-            (id, platform, client, product, sales, company, start_date, end_date, seconds, spots, amount_net, updated_at, contract_id, seconds_type, project_amount_net, split_amount)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, [(*t, None) for t in orders])
-        conn.commit()
-        conn.close()
-        conn_read = get_db_connection()
-        df_orders = pd.read_sql("SELECT * FROM orders", conn_read)
-        conn_read.close()
-        custom_settings = load_platform_settings()
-        build_ad_flight_segments(df_orders, custom_settings, write_to_db=True)
-        # 依專案實收金額與使用秒數比例計算並寫回拆分金額
-        contracts_with_project = df_orders.loc[df_orders['project_amount_net'].notna() & (pd.to_numeric(df_orders['project_amount_net'], errors='coerce') > 0), 'contract_id'].dropna().unique()
-        for cid in contracts_with_project:
-            if cid:
-                _compute_and_save_split_amount_for_contract(str(cid))
-        _sync_sheets_if_enabled()
-        return True, f"已產生 {len(orders)} 筆 2026 年模擬資料（專案實收金額＋自動計算拆分金額）"
-    except Exception as e:
-        conn.rollback()
-        conn.close()
-        return False, str(e)
-
-
-def load_mock_data_with_capacity_to_db(n=200, year=2026):
-    """
-    產生 n 筆模擬資料並寫入 orders，同時產生模擬容量設定和採購資料，使使用率控制在 0-120%。
-    回傳 (success: bool, message: str)
-    """
-    init_db()
-    # 先產生訂單和檔次段
-    success1, msg1 = load_mock_data_to_db(n=n)
-    if not success1:
-        return False, f"產生訂單失敗：{msg1}"
-    # 再產生容量設定（根據實際使用秒數，使使用率在 50-120%）
-    success2, msg2 = generate_mock_capacity_for_year(year=year, target_usage_min=50, target_usage_max=120)
-    if not success2:
-        return False, f"產生容量設定失敗：{msg2}"
-    # 產生模擬採購資料，但採購秒數要 >= 實際使用秒數，避免覆蓋容量後導致使用率破千
-    success3, msg3 = generate_mock_platform_purchase_for_year_with_capacity_check(year)
-    if not success3:
-        return False, f"產生採購資料失敗：{msg3}"
-    return True, f"{msg1}；{msg2}；{msg3}"
 
 
 def _extract_google_sheet_id(url_or_id):
@@ -4900,21 +4612,7 @@ if role == "行政主管":
                 st.success("已刪除")
                 st.rerun()
 
-# 模擬資料：一鍵產生訂單、容量、採購，供各分頁呈現（含表3 使用率、ROI 多樣性）
 st.sidebar.markdown("### 📊 資料來源")
-if st.sidebar.button("🎲 產生模擬資料", type="primary", help="產生 200 筆訂單＋容量＋採購，表3 使用率 50–120%、ROI 具正負多樣性", key="btn_mock_data"):
-    with st.spinner("正在產生模擬資料（訂單、容量、採購）..."):
-        success, msg = load_mock_data_with_capacity_to_db(n=200, year=2026)
-        if success:
-            to_del = [k for k in st.session_state if str(k).startswith("purchase_sec_") or str(k).startswith("purchase_price_")]
-            for k in to_del:
-                del st.session_state[k]
-            st.sidebar.success(msg)
-            time.sleep(0.5)
-            st.rerun()
-        else:
-            st.sidebar.error(f"產生失敗: {msg}")
-
 # 匯入 Google 試算表（表1結構）
 with st.sidebar.expander("📥 匯入 Google 試算表（表1結構）", expanded=False):
     st.caption("貼上試算表網址或 ID，結構需含：平台、起始日、終止日、秒數、每天總檔次、客戶(HYUNDAI_CUSTIN)、素材、業務、公司、合約編號、實收金額、秒數用途等。")
@@ -4978,7 +4676,7 @@ with st.sidebar.expander("設定平台店數與營業時間"):
             st.success("設定已儲存！")
             st.rerun()
     else:
-        st.info("請先產生模擬資料")
+        st.info("請先新增訂單或匯入資料")
 
 # --- 主畫面：讀取資料（使用快取，切換年月/篩選時不重算）---
 _db_mtime = os.path.getmtime(DB_FILE) if os.path.exists(DB_FILE) else 0
@@ -4986,7 +4684,7 @@ st.session_state['_db_mtime'] = _db_mtime  # 表3 fragment 重跑時用
 df_orders = _load_orders_cached(_db_mtime)
 
 if df_orders.empty:
-    st.warning("📭 資料庫為空，請按左側按鈕產生模擬資料。")
+    st.warning("📭 資料庫為空，請由左側匯入試算表或新增訂單。")
     st.stop()
 
 # 重新載入設定（確保最新）
@@ -5044,9 +4742,9 @@ def _render_tab3(role_readonly=False):
     sel_month = st.number_input("月份", min_value=1, max_value=12, value=default_month, key="table3_month")
 
     if df_daily_t3.empty or df_seg_t3.empty:
-        st.warning("📭 尚無每日或檔次段資料，請先產生模擬資料。")
+        st.warning("📭 尚無每日或檔次段資料，請先匯入或新增資料。")
     elif '媒體平台' not in df_daily_t3.columns:
-        st.warning("📭 每日資料尚無媒體平台欄位，請重新產生模擬資料。")
+        st.warning("📭 每日資料尚無媒體平台欄位，請重新匯入或檢查資料。")
     else:
         monthly_cap = load_platform_monthly_capacity_for(sel_year, sel_month)
         cap_tuple = tuple(sorted(monthly_cap.items())) if monthly_cap else ()
@@ -5180,7 +4878,7 @@ st.markdown("---")
 
 if selected_tab == "📋 表1-資料":
     st.markdown("### 📋 表1－資料（訂單主表）")
-    st.caption("此表對應 Excel：秒數管理表 → 表1-資料，為行政與業務對帳用之訂單主表。目前使用模擬資料呈現。")
+    st.caption("此表對應 Excel：秒數管理表 → 表1-資料，為行政與業務對帳用之訂單主表。")
     # 換月份時不重算：表1 依 _db_mtime 快取於 session_state
     if st.session_state.get('_table1_cache_key') == _db_mtime and '_table1_cache' in st.session_state:
         df_table1 = st.session_state['_table1_cache']
@@ -5558,7 +5256,7 @@ elif selected_tab == "📅 表2-秒數明細":
     
     df_seg_t2 = _load_segments_cached(_db_mtime)
     if df_seg_t2.empty or df_daily.empty:
-        st.warning("📭 尚無檔次段或每日資料，請先產生模擬資料。")
+        st.warning("📭 尚無檔次段或每日資料，請先匯入或新增資料。")
     else:
         # 換月份時不重算：表2 依 _db_mtime 快取於 session_state
         if st.session_state.get('_table2_cache_key') == _db_mtime and '_table2_summary' in st.session_state and '_table2_details' in st.session_state:
@@ -6016,15 +5714,15 @@ elif selected_tab == "📉 總結表圖表":
             except Exception as e:
                 st.caption(f"下載 Excel 時發生錯誤：{e}")
         else:
-            st.warning("📭 尚無每日資料或媒體平台欄位，請先產生模擬資料。")
+            st.warning("📭 尚無每日資料或媒體平台欄位，請先匯入或新增資料。")
     else:
-        st.warning("📭 尚無每日資料，請先產生模擬資料。")
+        st.warning("📭 尚無每日資料，請先匯入或新增資料。")
 
 elif selected_tab == "📊 分公司×媒體 每月秒數":
     st.markdown("### 📊 分公司 × 媒體平台 使用總秒數")
     st.caption("多種圖表回答不同決策問題：結構、總量、誰用最多、是否失衡、趨勢。")
     if df_daily.empty or '使用店秒' not in df_daily.columns or '公司' not in df_daily.columns or '媒體平台' not in df_daily.columns:
-        st.warning("📭 尚無每日資料或缺少「公司」「媒體平台」「使用店秒」欄位，請先產生模擬資料。")
+        st.warning("📭 尚無每日資料或缺少「公司」「媒體平台」「使用店秒」欄位，請先匯入或新增資料。")
     else:
         df_v = df_daily.copy()
         df_v['日期'] = pd.to_datetime(df_v['日期'], errors='coerce')
@@ -6228,25 +5926,12 @@ elif selected_tab == "📊 分公司×媒體 每月秒數":
                 st.caption("尚無分公司或媒體資料。")
 
         else:
-            st.caption("尚無分公司或媒體資料，或該時間範圍無使用資料，請先產生模擬資料。")
+            st.caption("尚無分公司或媒體資料，或該時間範圍無使用資料，請先匯入或新增資料。")
 
 elif selected_tab == "📋 媒體秒數與採購":
     st.markdown("### 📋 媒體秒數與採購")
     st.caption("輸入各媒體平台「一年 12 個月」的購買秒數與購買價格；儲存後會同步更新表3 的當月每日可用秒數，並供 ROI 分頁計算成本。")
     purchase_year = st.number_input("年度", min_value=2020, max_value=2030, value=datetime.now().year, key="purchase_year")
-    if st.button("🎲 產生模擬採購資料（測試用）", type="secondary", key="gen_mock_purchase", help="為上述年度、所有媒體產生 1～12 月合理模擬數據，方便測試表3 與 ROI 分頁"):
-        with st.spinner("正在產生模擬採購資料..."):
-            ok, msg = generate_mock_platform_purchase_for_year(purchase_year)
-            if ok:
-                # 清除所有相關的 session_state，確保輸入框會重新載入資料庫的值
-                to_del = [k for k in st.session_state if str(k).startswith("purchase_sec_") or str(k).startswith("purchase_price_")]
-                for k in to_del:
-                    del st.session_state[k]
-                st.success(msg)
-                time.sleep(0.3)  # 短暫延遲確保資料庫寫入完成
-                st.rerun()
-            else:
-                st.error(f"產生失敗：{msg}")
     # 每次頁面載入時都重新從資料庫讀取最新資料
     existing = load_platform_monthly_purchase_all_media_for_year(purchase_year)
     import calendar
@@ -6266,7 +5951,7 @@ elif selected_tab == "📋 媒體秒數與採購":
                 default_sec = int(sec) if sec else 0
                 default_price = float(pr) if pr else 0.0
                 # 當 session_state 中沒有值時，使用資料庫的值作為預設值
-                # 這樣當產生模擬資料後清除 session_state，輸入框會自動顯示新的資料庫值
+                # 清除 session_state 後輸入框會重新載入資料庫值
                 inputs_sec[m] = st.number_input(
                     "購買秒數",
                     min_value=0,
@@ -6526,7 +6211,7 @@ elif selected_tab == "🧪 實驗分頁":
         with st.expander("📋 日粒度事實表（daily_inventory）", expanded=False):
             st.dataframe(_styler_one_decimal(daily_inv), use_container_width=True, height=400)
     else:
-        st.warning("📭 尚無每日資料，請先產生模擬資料。")
+        st.warning("📭 尚無每日資料，請先匯入或新增資料。")
 
 elif selected_tab == "📊 ROI":
     st.markdown("### 📊 ROI 投報分析")
