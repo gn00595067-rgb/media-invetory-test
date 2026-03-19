@@ -6115,6 +6115,7 @@ elif selected_tab == "🧪 Ragic抓取測試":
         return {
             "_ragicId": e.get("_ragicId"),
             "訂檔單號": g("訂檔單號"),
+            "建立日期": g("建立日期"),
             "客戶": g("客戶"),
             "產品名稱": g("產品名稱"),
             "平台": g("平台"),
@@ -6160,11 +6161,15 @@ elif selected_tab == "🧪 Ragic抓取測試":
         # 本機日期篩選
         if filter_field != "不篩" and (date_from or date_to):
             col = filter_field
-            df[col + "_date"] = df[col].apply(_to_date)
-            if date_from:
-                df = df[df[col + "_date"].notna() & (df[col + "_date"] >= date_from)]
-            if date_to:
-                df = df[df[col + "_date"].notna() & (df[col + "_date"] <= date_to)]
+            if col not in df.columns:
+                st.warning(f"抓取結果沒有欄位「{col}」，已略過日期篩選。")
+            else:
+                df[col + "_date"] = df[col].apply(_to_date)
+            if col in df.columns:
+                if date_from:
+                    df = df[df[col + "_date"].notna() & (df[col + "_date"] >= date_from)]
+                if date_to:
+                    df = df[df[col + "_date"].notna() & (df[col + "_date"] <= date_to)]
 
         # 關鍵字篩選
         if keyword.strip():
