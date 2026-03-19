@@ -281,6 +281,10 @@ def render_table1_tab(
                         st.error("Google Sheet 同步失敗：" + "; ".join(errs[:5]))
                 if "_table1_cache_key" in st.session_state:
                     del st.session_state["_table1_cache_key"]
+                # 更新後若仍維持「只顯示尚未填寫」，剛更新的 rows 會立刻被過濾掉，看起來像「全部消失」。
+                # 所以在成功更新後自動切換回顯示全部，讓你能立刻確認更新結果。
+                if only_missing:
+                    st.session_state["seg_missing_only"] = False
                 st.success(f"✅ 已批次更新 {len(seg_id_selected_list)} 筆 segments 的 seconds_type。")
                 st.rerun()
 
