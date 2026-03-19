@@ -253,6 +253,11 @@ def render_order_crud_panel(
         conn_list.close()
         st.info("📭 尚無訂單資料，請於上方「新增一筆訂單」填寫後儲存。")
     else:
+        # 總筆數醒目顯示，方便與表1「訂單筆數」對照；有搜尋時為符合條件的筆數
+        if crud_kw and str(crud_kw).strip():
+            st.markdown(f"**📊 符合搜尋條件：{total_rows:,} 筆**")
+        else:
+            st.markdown(f"**📊 訂單總筆數：{total_rows:,} 筆**")
         total_pages = max(1, (total_rows + int(page_size) - 1) // int(page_size))
         p1, p2 = st.columns([1, 3])
         with p1:
