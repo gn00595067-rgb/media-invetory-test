@@ -83,25 +83,7 @@ def render_ragic_test_tab(
 
     keyword = st.text_input("關鍵字（訂檔單號/客戶/產品/平台 任一包含）", value="")
 
-    # 先顯示 log（避免後續 st.stop 讓使用者看不到）
-    st.markdown("---")
-    st.markdown("#### 🧾 Debug Log（可直接複製貼回）")
-    log_text = "\n".join(st.session_state.get("_ragic_debug_log", []))
-    st.session_state["ragic_debug_log_area"] = log_text
-    st.text_area("log", value=st.session_state.get("ragic_debug_log_area", ""), height=220, key="ragic_debug_log_area")
-    b1, b2 = st.columns([1, 3])
-    with b1:
-        if st.button("清除 log", key="btn_clear_ragic_log"):
-            st.session_state["_ragic_debug_log"] = []
-            st.rerun()
-    with b2:
-        st.download_button(
-            "下載 log.txt",
-            data=(log_text or "").encode("utf-8"),
-            file_name=f"ragic_debug_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-            mime="text/plain",
-            key="download_ragic_log",
-        )
+    st.caption("Debug Log 會在本頁最下方顯示（包含每個 Excel 的下載/工作表/每日檔次抽樣）。")
 
     def _deep_collect_excel_tokens(val: Any) -> list[str]:
         """地毯式從 entry 中找出任何 .xlsx/.xls 的 ragic token（含巢狀 dict/list/子表）。"""
@@ -197,7 +179,7 @@ def render_ragic_test_tab(
         if not api_key.strip():
             st.error("請輸入 Ragic API Key（可放 .streamlit/secrets.toml 的 RAGIC_API_KEY）。")
             _log("API Key 為空，停止")
-            st.stop()
+            return
 
         ref = parse_sheet_url(ragic_url)
         api_url = make_listing_url(ref, limit=int(limit), offset=int(offset), subtables0=subtables0, fts="")
@@ -207,7 +189,7 @@ def render_ragic_test_tab(
         if err:
             st.error(f"抓取失敗：{err}")
             _log(f"抓取失敗：{err}")
-            st.stop()
+            return
 
         st.caption(f"API 回傳 keys 數量：{len(payload) if isinstance(payload, dict) else '非 dict'}")
         _log(f"payload type={type(payload).__name__}")
@@ -226,7 +208,7 @@ def render_ragic_test_tab(
         if not entries:
             st.warning("沒有抓到任何資料（可能沒有權限或資料為空）。")
             _log("entries 為空，停止")
-            st.stop()
+            return
 
         try:
             e0 = entries[0]
@@ -309,6 +291,17 @@ def render_ragic_test_tab(
                         prog.progress(int((idx + 1) / max(1, len(file_jobs)) * 100))
                         continue
                     try:
+                        size_kb = int(len(content) / 1024)
+                        _log(f"[auto-parse] downloaded bytes={len(content)} (~{size_kb}KB) token={tok}")
+                        # 額外：列出工作表名（協助判斷是不是 cueapp 產出的 CUE 表）
+                        try:
+                            import pandas as _pd
+                            import io as _io
+                            xls_ = _pd.ExcelFile(_io.BytesIO(content), engine="openpyxl")
+                            _log(f"[auto-parse] sheets={xls_.sheet_names[:10]}")
+                        except Exception as e:
+                            _log(f"[auto-parse] list sheets failed: {e}")
+
                         cue_units = parse_cue_excel_for_table1(content, order_info=None)
                         ad_units = len(cue_units) if cue_units else 0
                         # 摘要：起迄日、總檔次（合計）
@@ -326,6 +319,8 @@ def render_ragic_test_tab(
                             "start_date_min": min(starts) if starts else "",
                             "end_date_max": max(ends) if ends else "",
                             "total_spots_sum": total_spots_sum,
+                            "sample_daily_spots": (cue_units[0].get("daily_spots") or [])[:14] if cue_units else [],
+                            "sample_dates": (cue_units[0].get("dates") or [])[:14] if cue_units else [],
                             "error": "",
                         })
                         _log(f"[auto-parse] ok token={tok} ad_units={ad_units} total_spots_sum={total_spots_sum}")
@@ -336,6 +331,7 @@ def render_ragic_test_tab(
 
                 if parsed_rows:
                     st.dataframe(pd.DataFrame(parsed_rows), use_container_width=True, hide_index=True)
+                    st.caption("`sample_daily_spots/sample_dates` 為第一個 ad_unit 的前 14 天抽樣，方便快速核對每日檔次。")
                 else:
                     st.info("沒有可解析的 Excel token（或尚未啟用自動解析）。")
         else:
@@ -481,4 +477,22 @@ def render_ragic_test_tab(
     st.markdown("#### 📎 最後一次 Excel 掃描結果（可複製）")
     excel_rows = st.session_state.get("_ragic_last_listing_excel", [])
     st.text_area("excel_scan_json", value=json.dumps(excel_rows, ensure_ascii=False, indent=2), height=160, key="ragic_excel_scan_area")
+
+    st.markdown("#### 🧾 Debug Log（可直接複製貼回）")
+    log_text = "\n".join(st.session_state.get("_ragic_debug_log", []))
+    st.session_state["ragic_debug_log_area"] = log_text
+    st.text_area("log", value=st.session_state.get("ragic_debug_log_area", ""), height=260, key="ragic_debug_log_area")
+    b1, b2 = st.columns([1, 3])
+    with b1:
+        if st.button("清除 log", key="btn_clear_ragic_log"):
+            st.session_state["_ragic_debug_log"] = []
+            st.rerun()
+    with b2:
+        st.download_button(
+            "下載 log.txt",
+            data=(log_text or "").encode("utf-8"),
+            file_name=f"ragic_debug_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            mime="text/plain",
+            key="download_ragic_log",
+        )
 
