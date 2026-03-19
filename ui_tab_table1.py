@@ -145,7 +145,90 @@ def render_table1_tab(
         total_amount = df_table1["實收金額"].sum() if "實收金額" in df_table1.columns else 0
         st.metric("實收金額總計", f"{total_amount:,}")
 
-    # 不再需要提示「Segments 模式切換」，因為 Table1 永遠使用 Segments。
+    # 以商業口徑：Table1 永遠用 Segments 為主體，所以提供基於 segments 的秒數用途編輯。
+
+    st.markdown("#### 🧩 Segments 秒數用途快速編輯（優先）")
+    with st.expander("🔧 顯示／編輯尚未填寫 seconds_type 的 Segments", expanded=False):
+        if df_seg_main is None or df_seg_main.empty:
+            st.info("目前 segments 為空，無可編輯資料。")
+        else:
+            df_seg_editor = df_seg_main.copy()
+            # 可能欄位不齊時的保護
+            for col in ["segment_id", "seconds_type", "company", "sales", "client", "platform", "channel", "region"]:
+                if col not in df_seg_editor.columns:
+                    df_seg_editor[col] = ""
+
+            only_missing = st.checkbox("只顯示尚未填寫 seconds_type", value=True, key="seg_missing_only")
+            kw = st.text_input("關鍵字（segment_id / 公司 / 客戶 / 平台）", value="", key="seg_edit_kw").strip().lower()
+
+            if only_missing:
+                seg_type_str = df_seg_editor["seconds_type"].fillna("").astype(str).str.strip()
+                df_seg_editor = df_seg_editor[(seg_type_str == "") | (~df_seg_editor["seconds_type"].isin(seconds_usage_types))]
+
+            if kw:
+                df_seg_editor = df_seg_editor[
+                    df_seg_editor["segment_id"].astype(str).str.lower().str.contains(kw)
+                    | df_seg_editor["company"].astype(str).str.lower().str.contains(kw)
+                    | df_seg_editor["client"].astype(str).str.lower().str.contains(kw)
+                    | df_seg_editor["platform"].astype(str).str.lower().str.contains(kw)
+                ]
+
+            st.caption(f"可編輯 segments 筆數：{len(df_seg_editor)}")
+            show_df = df_seg_editor.head(200).copy()
+            if not show_df.empty:
+                show_df["segment_id_short"] = show_df["segment_id"].astype(str).str[:8]
+                show_cols = [c for c in ["segment_id_short", "segment_id", "seconds_type", "company", "sales", "client", "platform", "region", "start_date", "end_date"] if c in show_df.columns]
+                st.dataframe(
+                    show_df[show_cols],
+                    use_container_width=True,
+                    hide_index=True,
+                    height=320,
+                )
+
+            # 套用編輯：用 selectbox 選 segment_id（比整張 data_editor 更穩、也更快）
+            if not df_seg_editor.empty:
+                seg_id_options = df_seg_editor["segment_id"].astype(str).tolist()
+                seg_id_selected = st.selectbox("選擇要編輯的 segment_id", seg_id_options, key="seg_edit_segment_id")
+                current_stype = ""
+                try:
+                    cur_row = df_seg_editor[df_seg_editor["segment_id"].astype(str) == str(seg_id_selected)]
+                    if not cur_row.empty:
+                        current_stype = str(cur_row.iloc[0].get("seconds_type", "") or "")
+                except Exception:
+                    current_stype = ""
+
+                new_seconds_type = st.selectbox(
+                    "新的秒數用途(seconds_type)",
+                    options=list(seconds_usage_types),
+                    index=list(seconds_usage_types).index(current_stype) if current_stype in seconds_usage_types else 0,
+                    key="seg_edit_new_seconds_type",
+                )
+
+                auto_sync = st.checkbox("套用後立即同步 Google Sheet", value=True, key="seg_edit_auto_sync")
+                if st.button("套用並同步", type="primary", disabled=not seg_id_selected, key="seg_edit_apply_sync"):
+                    now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    conn_upd = get_db_connection()
+                    try:
+                        conn_upd.execute(
+                            "UPDATE ad_flight_segments SET seconds_type=?, updated_at=? WHERE segment_id=?",
+                            (new_seconds_type, now_ts, seg_id_selected),
+                        )
+                        conn_upd.commit()
+                    except Exception as e:
+                        conn_upd.rollback()
+                        conn_upd.close()
+                        st.error(f"Segments seconds_type 更新失敗：{e}")
+                        st.stop()
+                    conn_upd.close()
+
+                    if auto_sync:
+                        errs = sync_sheets_if_enabled(only_tables=["Segments"], skip_if_unchanged=False)
+                        if errs:
+                            st.error("Google Sheet 同步失敗：" + "; ".join(errs[:5]))
+                    if "_table1_cache_key" in st.session_state:
+                        del st.session_state["_table1_cache_key"]
+                    st.success("✅ 已更新 segments 的 seconds_type。")
+                    st.rerun()
 
     with st.expander("🔍 篩選條件", expanded=False):
         c1, c2, c3 = st.columns(3)

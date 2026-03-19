@@ -177,6 +177,7 @@ def import_google_sheet_to_orders_service(
     url_or_id: str,
     replace_existing: bool,
     normalize_seconds_type: Callable[[str], str],
+    merge_orders_by_contract_id: bool = False,
     init_db: Callable[[], None],
     get_db_connection: Callable[[], object],
     load_platform_settings: Callable[[], dict],
@@ -218,6 +219,53 @@ def import_google_sheet_to_orders_service(
             orders.append(t)
     if not orders:
         return False, "沒有可匯入的資料列（需有平台、起始日、終止日且為有效日期）"
+
+    # 預留設計：若未來 Google Sheet 可提供 contract_id，
+    # 才啟用「同合約內容相同才合併去重」。
+    # 目標是：避免重複列造成 orders/segments 放大，同時不破壞不同切分（start/end/spots/seconds 等不同）。
+    if merge_orders_by_contract_id:
+        # orders tuple 結構：
+        # (0)id,(1)platform,(2)client,(3)product,(4)sales,(5)company,(6)start_date,(7)end_date,(8)seconds,(9)spots,
+        # (10)amount_net,(11)updated_at,(12)contract_id,(13)seconds_type,(14)project_amount_net
+        by_contract: dict[str, list[tuple]] = {}
+        for t in orders:
+            cid = t[12]
+            cid_key = str(cid).strip() if cid not in (None, "") else ""
+            if not cid_key:
+                continue
+            by_contract.setdefault(cid_key, []).append(t)
+
+        if by_contract:
+            keep_ids = set()
+            # 對每個 contract_id：若所有欄位除 id/updated_at 外都相同，則合併（保留第一筆）
+            # 若內容不同，因為切分可能不同，就不要合併，以免缺少應產生的 segment。
+            for cid_key, rows in by_contract.items():
+                if len(rows) <= 1:
+                    continue
+                # 以第一筆為基準
+                base = rows[0]
+                def content_sig(x: tuple) -> tuple:
+                    return (
+                        x[1], x[2], x[3], x[4], x[5],
+                        x[6], x[7], x[8], x[9],
+                        x[10], x[12], x[13], x[14],
+                    )
+                sig = content_sig(base)
+                if all(content_sig(x) == sig for x in rows):
+                    keep_ids.add(str(base[0]))
+                else:
+                    # 不合併：保留原本所有 rows（因為切分不同）
+                    for x in rows:
+                        keep_ids.add(str(x[0]))
+
+            # 對於沒有 contract_id 的 rows，照原樣保留
+            new_orders = []
+            for t in orders:
+                if str(t[0]) in keep_ids:
+                    new_orders.append(t)
+                elif t[12] in (None, ""):
+                    new_orders.append(t)
+            orders = new_orders
 
     init_db()
     conn = get_db_connection()

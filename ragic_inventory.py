@@ -567,7 +567,7 @@ def _normalize_date(val):
     return _normalize_date_impl(val)
 
 
-def import_google_sheet_to_orders(url_or_id, replace_existing=True):
+def import_google_sheet_to_orders(url_or_id, replace_existing=True, merge_orders_by_contract_id: bool = False):
     """
     從 Google 試算表（表1結構）匯入至 orders，並建立 ad_flight_segments。
     url_or_id: 試算表完整網址或 Sheet ID。
@@ -579,6 +579,7 @@ def import_google_sheet_to_orders(url_or_id, replace_existing=True):
     return import_google_sheet_to_orders_service(
         url_or_id=url_or_id,
         replace_existing=replace_existing,
+        merge_orders_by_contract_id=merge_orders_by_contract_id,
         normalize_seconds_type=_normalize_seconds_type,
         init_db=init_db,
         get_db_connection=get_db_connection,
