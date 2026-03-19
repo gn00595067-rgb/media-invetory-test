@@ -97,10 +97,6 @@ def render_table3_tab(
                 st.markdown(f"- {suggestion}")
                 st.markdown("")
 
-                for col in date_cols_t3:
-                    val = df_t3.at[3, col]
-                    if isinstance(val, (int, float)) and pd.notna(val):
-                        df_t3.at[3, col] = f"{round(float(val), 1)}%"
                 orig_row4 = table3_data[mp].iloc[3].copy()
                 fixed_cols_t3 = ["授權", "項目", "秒數", "%"]
                 chunk_size = 6

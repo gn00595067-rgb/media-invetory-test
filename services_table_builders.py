@@ -146,10 +146,14 @@ def build_table2_summary_by_company(df_segments, df_daily, df_orders, get_media_
     seg_ord["_contract_key"] = seg_ord.get("contract_id").fillna(seg_ord["source_order_id"])
     by_company = seg_ord.groupby("company").agg(total_spots=("total_spots", "sum"), total_store_seconds=("total_store_seconds", "sum")).reset_index()
 
-    def _sum_amt_unique_contract(g):
-        return g.drop_duplicates("_contract_key")["amount_net"].sum()
-
-    amt_by_co = seg_ord.groupby("company").apply(_sum_amt_unique_contract).reindex(companies).fillna(0)
+    # 以「合約鍵」去重後加總，避免 groupby.apply 帶來的 FutureWarning + 也更快
+    amt_by_co = (
+        seg_ord.drop_duplicates(subset=["company", "_contract_key"])
+        .groupby("company")["amount_net"]
+        .sum()
+        .reindex(companies)
+        .fillna(0)
+    )
     by_company["實收金額"] = by_company["company"].map(amt_by_co).fillna(0).astype(int)
     by_company["除佣實收"] = by_company["實收金額"]
     by_company["委刊總檔數"] = by_company["total_spots"].fillna(0).astype(int)
@@ -184,14 +188,29 @@ def build_table2_summary_by_company(df_segments, df_daily, df_orders, get_media_
             n_date_cols=len(date_cols),
         )
     base_cols = ["公司", "實收金額", "除佣實收", "委刊總檔數", "使用總秒數"]
-    out = by_company[["company", "實收金額", "除佣實收", "委刊總檔數", "使用總秒數"]].copy()
-    out.columns = base_cols
-    for c in date_cols:
-        if c in by_company.columns:
-            out[c] = by_company[c].fillna(0).astype(int)
-    subtotal = {"公司": "小計", "實收金額": out["實收金額"].sum(), "除佣實收": out["除佣實收"].sum(), "委刊總檔數": out["委刊總檔數"].sum(), "使用總秒數": out["使用總秒數"].sum()}
-    for c in date_cols:
-        subtotal[c] = out[c].sum() if c in out.columns else 0
+    out_base = by_company[["company", "實收金額", "除佣實收", "委刊總檔數", "使用總秒數"]].copy()
+    out_base.columns = base_cols
+
+    date_cols_exist = [c for c in date_cols if c in by_company.columns]
+    if date_cols_exist:
+        # 一次 concat 進 out，避免逐欄 insert 造成 fragmentation
+        out_dates = by_company[date_cols_exist].fillna(0).astype(int)
+        out = pd.concat([out_base, out_dates], axis=1)
+        date_sums = out_dates.sum(axis=0).to_dict()
+    else:
+        out = out_base
+        date_sums = {}
+
+    subtotal = {
+        "公司": "小計",
+        "實收金額": int(out["實收金額"].sum()),
+        "除佣實收": int(out["除佣實收"].sum()),
+        "委刊總檔數": int(out["委刊總檔數"].sum()),
+        "使用總秒數": int(out["使用總秒數"].sum()),
+    }
+    for c, s in date_sums.items():
+        subtotal[c] = int(s)
+
     out = pd.concat([out, pd.DataFrame([subtotal])], ignore_index=True)
     log_timing(
         "table2_summary.total",
@@ -650,13 +669,14 @@ def build_table3_monthly_control(
         row_cap = {"授權": "總經理", "項目": "可用秒數", "秒數": int(total_cap), "%": f"{pct_unused:.1f}"}
         # 秒數欄位在不同列混用 '' 與 int 會讓 st.dataframe 走到 pyarrow 型別推斷失敗（ArrowInvalid）。
         # 這裡統一用 0 來保持欄位型別一致。
-        row_util = {"授權": "總經理", "項目": "使用率", "秒數": 0, "%": "100.0"}
+        row_util = {"授權": "總經理", "項目": "使用率", "秒數": 0, "%": 100.0}
         row_color = {"授權": "業務", "項目": "可排日", "秒數": 0, "%": ""}
         for i in range(len(all_dates)):
             row_used[date_cols[i]] = int(used_by_date.iloc[i]) if i < len(used_by_date) else 0
             row_cap[date_cols[i]] = int(cap_series.iloc[i]) if i < len(cap_series) else 0
             u = util_series.iloc[i] if i < len(util_series) else 0
-            row_util[date_cols[i]] = f"{round(float(u), 1)}%" if pd.notna(u) else "0%"
+            # 日期欄位一律放數值（不要帶 % 字串），避免 ArrowInvalid（'0.0%' -> int64）
+            row_util[date_cols[i]] = round(float(u), 1) if pd.notna(u) else 0.0
             row_color[date_cols[i]] = float(u) if pd.notna(u) else 0
         result[mp] = pd.DataFrame([row_used, row_cap, row_util, row_color])
     return result
