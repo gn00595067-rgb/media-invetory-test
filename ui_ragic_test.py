@@ -311,6 +311,87 @@ def _entry_to_table1_ragic_overrides(entry: dict, ragic_fields: dict[str, str]) 
     return overrides
 
 
+def _to_float_or_none(v: Any) -> float | None:
+    """安全轉成 float；無法轉換回傳 None。"""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    s = str(v).strip().replace(",", "")
+    if not s or s in (PLACEHOLDER_MISSING, PLACEHOLDER_NOT_AVAILABLE):
+        return None
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _apply_split_amount_by_spots(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    依「同一專案(合約編號)的委刊總檔數比例」計算拆分金額。
+    - 專案總額優先取：專案實收金額，其次實收金額，再其次除佣實收
+    - 各列拆分金額為整數，且加總精準等於專案總額
+    """
+    if df is None or df.empty:
+        return df
+    if "合約編號" not in df.columns or "委刊總檔數" not in df.columns:
+        return df
+
+    out = df.copy()
+    if "拆分金額" not in out.columns:
+        out["拆分金額"] = PLACEHOLDER_MISSING
+
+    for contract_id, idxs in out.groupby("合約編號").groups.items():
+        idx_list = list(idxs)
+        if not idx_list:
+            continue
+
+        # 取此專案總額（第一個可解析值）
+        project_total = None
+        for amount_col in ("專案實收金額", "實收金額", "除佣實收"):
+            if amount_col not in out.columns:
+                continue
+            for i in idx_list:
+                val = _to_float_or_none(out.at[i, amount_col])
+                if val is not None:
+                    project_total = val
+                    break
+            if project_total is not None:
+                break
+
+        # 沒有金額可拆則保留原值
+        if project_total is None:
+            continue
+
+        # 檔次權重
+        spots = []
+        for i in idx_list:
+            sp = _to_float_or_none(out.at[i, "委刊總檔數"]) or 0.0
+            spots.append(max(0.0, sp))
+        total_spots = sum(spots)
+        if total_spots <= 0:
+            continue
+
+        raw_alloc = [project_total * (sp / total_spots) for sp in spots]
+        floors = [int(x) for x in raw_alloc]
+        remainder = int(round(project_total)) - sum(floors)
+
+        # 把剩餘金額分配給小數部分最大的列，確保加總正確
+        frac_order = sorted(
+            range(len(raw_alloc)),
+            key=lambda k: (raw_alloc[k] - floors[k]),
+            reverse=True,
+        )
+        alloc = floors[:]
+        for k in frac_order[: max(0, remainder)]:
+            alloc[k] += 1
+
+        for local_i, row_i in enumerate(idx_list):
+            out.at[row_i, "拆分金額"] = alloc[local_i]
+
+    return out
+
+
 # 常見附檔副檔名（Ragic 附檔 token 常為 ...@xxx.副檔名）
 FILE_EXTENSIONS = (".xlsx", ".xls", ".pdf", ".jpg", ".jpeg", ".png", ".doc", ".docx", ".csv")
 
@@ -686,6 +767,8 @@ def render_ragic_test_tab(
         for col, val in ragic_overrides.items():
             if col in df_combined.columns and val not in (None, ""):
                 df_combined[col] = val
+        # 拆分金額：依同專案委刊總檔數比例分配（符合專案金額拆分邏輯）
+        df_combined = _apply_split_amount_by_spots(df_combined)
         # 與 表1-資料 最大權限相同：可橫向滾動、完整欄位
         st.markdown("#### 📊 表1-資料（可橫向滾動查看完整欄位）")
         st.dataframe(
