@@ -1021,6 +1021,78 @@ def parse_cueapp_excel(file_content):
             eff_days = None
             header_row_idx = None
 
+            def _find_schedule_header_row(_df: pd.DataFrame):
+                def _row_text(i: int) -> str:
+                    try:
+                        return _df.iloc[i].fillna('').astype(str).str.cat(sep=' ')
+                    except Exception:
+                        return ''
+                for i in range(min(40, len(_df))):
+                    t = _row_text(i)
+                    if ('頻道' in t and '播出地區' in t and '秒數' in t) or ('Station' in t and 'Location' in t and ('Size' in t or '秒數' in t)):
+                        return i
+                return None
+
+            def _parse_day_cell(v):
+                v = _cell_val(v)
+                if isinstance(v, (datetime, date)):
+                    # 1900-01-20 這種，取 day=20
+                    try:
+                        return int(v.day)
+                    except Exception:
+                        return None
+                if isinstance(v, (int, float)) and not pd.isna(v):
+                    try:
+                        n = int(round(float(v)))
+                        return n if 1 <= n <= 31 else None
+                    except Exception:
+                        return None
+                if isinstance(v, str):
+                    s = v.strip()
+                    if s.isdigit():
+                        n = int(s)
+                        return n if 1 <= n <= 31 else None
+                return None
+
+            def _infer_year_from_df(_df: pd.DataFrame):
+                try:
+                    for i in range(min(25, len(_df))):
+                        for j in range(min(15, _df.shape[1])):
+                            s = str(_df.iloc[i, j]) if _df.iloc[i, j] is not None else ''
+                            m = re.search(r'(20\d{2})', s)
+                            if m:
+                                y = int(m.group(1))
+                                if 2000 <= y <= 2100:
+                                    return y
+                except Exception:
+                    pass
+                return None
+
+            def _infer_month_for_col(_df: pd.DataFrame, header_i: int, col_j: int):
+                # 先找同欄往上最近的「x月」
+                for i in range(max(0, header_i - 6), header_i):
+                    try:
+                        s = str(_df.iloc[i, col_j]).strip()
+                        m = re.search(r'(\d{1,2})\s*月', s)
+                        if m:
+                            mm = int(m.group(1))
+                            if 1 <= mm <= 12:
+                                return mm
+                    except Exception:
+                        continue
+                # 再找同列往左最近的「x月」
+                for j in range(col_j, -1, -1):
+                    try:
+                        s = str(_df.iloc[header_i - 1, j]).strip()
+                        m = re.search(r'(\d{1,2})\s*月', s)
+                        if m:
+                            mm = int(m.group(1))
+                            if 1 <= mm <= 12:
+                                return mm
+                    except Exception:
+                        continue
+                return None
+
             if fmt == 'dongwu':
                 b5 = df.iloc[4, 1] if df.shape[1] > 1 else None
                 start_date, end_date = _parse_cueapp_period_dongwu(b5)
@@ -1041,27 +1113,115 @@ def parse_cueapp_excel(file_content):
                     eff_days = max(0, df.shape[1] - date_start_col - 1)
             else:
                 start_date, end_date = _parse_cueapp_period_shenghuo_bolin(df)
-                if not start_date or not end_date:
+                # Schedule/Media Schedule 常見沒有「檔次」欄，改用「日期數字欄」推導
+                header_row_idx = _find_schedule_header_row(df)
+                if header_row_idx is None:
                     continue
-                date_start_col = 5
-                header_row_idx = 6
-                for c in range(df.shape[1] - 1, date_start_col - 1, -1):
-                    try:
-                        val = str(df.iloc[header_row_idx, c]).strip() + str(df.iloc[header_row_idx + 1, c]).strip()
-                        if '檔次' in val:
-                            eff_days = c - date_start_col
+                # 找「秒數/Size」欄位置，日期欄從其右側開始
+                sec_col = None
+                for j in range(min(25, df.shape[1])):
+                    s = str(df.iloc[header_row_idx, j]).strip()
+                    if ('秒數' in s) or (s.lower() == 'size') or ('size' in s.lower()):
+                        sec_col = j
+                        break
+                if sec_col is None:
+                    continue
+                date_start_col = sec_col + 1
+                # 解析日期欄（以 header row 的 day number 連續欄位為準）
+                day_cols = []
+                for j in range(date_start_col, min(df.shape[1], date_start_col + 80)):
+                    d = _parse_day_cell(df.iloc[header_row_idx, j])
+                    if d is None:
+                        if day_cols:
                             break
-                    except IndexError:
                         continue
-                if eff_days is None:
-                    eff_days = max(0, df.shape[1] - date_start_col - 3)
+                    day_cols.append((j, d))
+                if not day_cols:
+                    continue
+                eff_days = len(day_cols)
+
+                # 嘗試推導 start/end（若原本解析不到）
+                year = _infer_year_from_df(df) or (start_date.year if start_date else None)
+                if year is None:
+                    year = datetime.now().year
+                # 逐欄推導月份：優先用「x月」標記，否則用遞增/回跳推斷
+                months = []
+                last_day = None
+                last_month = None
+                base_month = start_date.month if start_date else None
+                for (j, d) in day_cols:
+                    mm = _infer_month_for_col(df, header_row_idx, j) or base_month
+                    if mm is None:
+                        if last_month is None:
+                            mm = 1
+                        else:
+                            mm = last_month
+                    if last_day is not None and d < last_day and (mm == last_month):
+                        # day 回跳但月沒變，推進一個月
+                        mm = 1 if last_month == 12 else (last_month + 1)
+                    months.append(mm)
+                    last_day = d
+                    last_month = mm
+
+                dates = []
+                for (_, d), mm in zip(day_cols, months):
+                    try:
+                        dates.append(date(year, int(mm), int(d)))
+                    except Exception:
+                        dates.append(None)
+                # 濾掉 None
+                dates = [dt for dt in dates if dt is not None]
+                if not dates:
+                    continue
+                start_date = start_date or min(dates)
+                end_date = end_date or max(dates)
 
             if eff_days is None or eff_days <= 0:
                 continue
-            date_list = pd.date_range(start_date, end_date, freq='D')
-            if len(date_list) != eff_days:
-                date_list = date_list[:eff_days]
-            dates_str = [d.strftime('%Y-%m-%d') for d in date_list]
+            # dates_str：若為 schedule 型，使用 header 的 dates；否則用連續日期
+            dates_str = None
+            if fmt != 'dongwu' and header_row_idx is not None and date_start_col is not None:
+                # 重新嘗試以 header day_cols 組 dates_str（避免 start/end 連續推斷不準）
+                try:
+                    # 以同樣邏輯重取 day_cols（已算過 eff_days）
+                    day_cols2 = []
+                    for j in range(date_start_col, min(df.shape[1], date_start_col + 80)):
+                        d = _parse_day_cell(df.iloc[header_row_idx, j])
+                        if d is None:
+                            if day_cols2:
+                                break
+                            continue
+                        day_cols2.append((j, d))
+                    if day_cols2:
+                        year2 = _infer_year_from_df(df) or (start_date.year if start_date else datetime.now().year)
+                        months2 = []
+                        last_day2 = None
+                        last_month2 = start_date.month if start_date else None
+                        for (j, d) in day_cols2:
+                            mm = _infer_month_for_col(df, header_row_idx, j) or last_month2
+                            if mm is None:
+                                mm = 1
+                            if last_day2 is not None and d < last_day2 and (mm == last_month2):
+                                mm = 1 if last_month2 == 12 else (last_month2 + 1)
+                            months2.append(mm)
+                            last_day2 = d
+                            last_month2 = mm
+                        dates2 = []
+                        for (_, d), mm in zip(day_cols2, months2):
+                            try:
+                                dates2.append(date(int(year2), int(mm), int(d)))
+                            except Exception:
+                                pass
+                        if dates2:
+                            dates_str = [dt.strftime('%Y-%m-%d') for dt in dates2]
+                            eff_days = len(dates_str)
+                except Exception:
+                    dates_str = None
+            if not dates_str:
+                date_list = pd.date_range(start_date, end_date, freq='D')
+                if len(date_list) != eff_days:
+                    date_list = date_list[:eff_days]
+                dates_str = [d.strftime('%Y-%m-%d') for d in date_list]
 
             data_start_row = header_row_idx + 2
             platform_info = _extract_platform_from_sheet(df, sheet_name)
@@ -1080,7 +1240,16 @@ def parse_cueapp_excel(file_content):
                         continue
                     region_cell = row.iloc[1] if len(row) > 1 else ''
                     region = str(region_cell).strip() if region_cell is not None and str(region_cell) != 'nan' else platform_info.get('region', '全省')
-                    sec = _extract_seconds_from_cell(row.iloc[4] if len(row) > 4 else None)
+                    # 秒數欄：dongwu/shenghuo/bolin 可能在第 4 欄或 header 找到的 sec_col
+                    sec_cell = None
+                    try:
+                        if fmt != 'dongwu' and date_start_col is not None and date_start_col >= 1:
+                            sec_cell = row.iloc[date_start_col - 1]
+                        else:
+                            sec_cell = row.iloc[4] if len(row) > 4 else None
+                    except Exception:
+                        sec_cell = row.iloc[4] if len(row) > 4 else None
+                    sec = _extract_seconds_from_cell(sec_cell)
                     if sec <= 0:
                         sec = default_seconds
                     daily_spots = []
