@@ -5514,7 +5514,7 @@ if selected_tab == "📋 表1-資料":
                     build_ad_flight_segments(df_after, load_platform_settings(), write_to_db=True)
                     if project_val and project_val > 0 and contract_id_val:
                         _compute_and_save_split_amount_for_contract(contract_id_val)
-                    _sync_sheets_if_enabled()
+                    _sync_sheets_if_enabled(only_tables=["Orders", "Segments"], skip_if_unchanged=True)
                     st.success("✅ 已新增一筆")
                     if '_table1_cache_key' in st.session_state:
                         del st.session_state['_table1_cache_key']
@@ -5580,7 +5580,7 @@ if selected_tab == "📋 表1-資料":
                             build_ad_flight_segments(df_after, load_platform_settings(), write_to_db=True)
                             if project_val and project_val > 0 and edit_contract_id_val:
                                 _compute_and_save_split_amount_for_contract(edit_contract_id_val)
-                            _sync_sheets_if_enabled()
+                            _sync_sheets_if_enabled(only_tables=["Orders", "Segments"], skip_if_unchanged=True)
                             if "crud_edit_id" in st.session_state:
                                 del st.session_state["crud_edit_id"]
                             if '_table1_cache_key' in st.session_state:
@@ -5597,65 +5597,80 @@ if selected_tab == "📋 表1-資料":
                             del st.session_state["crud_edit_id"]
                         st.rerun()
 
-    # 每列一筆訂單，可直接編輯／刪除（同一行：左側欄位、右側 編輯／刪除）
+    # 訂單管理高效模式：搜尋 + 分頁 + 單筆操作（避免大量逐列按鈕造成卡頓）
     if df_orders_crud.empty:
         st.info("📭 尚無訂單資料，請於上方「新增一筆訂單」填寫後儲存。")
     else:
-        st.markdown("**每列一筆訂單，可點「編輯」或「刪除」**")
-        # 表頭列
-        hcols = st.columns([2, 1, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1])
-        for i, label in enumerate(["ID", "合約編號", "平台", "客戶", "產品", "起日", "訖日", "秒數", "檔次", "金額", "編輯", "刪除"]):
-            with hcols[i]:
-                st.markdown(f"**{label}**")
-        st.markdown("---")
-        for idx, row in df_orders_crud.iterrows():
-            cols = st.columns([2, 1, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1])
-            _cid = (row.get('contract_id') or '-') if pd.notna(row.get('contract_id')) and row.get('contract_id') else '-'
-            with cols[0]:
-                st.text(str(row['id'])[:20])
-            with cols[1]:
-                st.text(str(_cid)[:12])
-            with cols[2]:
-                st.text(str(row.get('platform', ''))[:14])
-            with cols[3]:
-                st.text(str(row.get('client', ''))[:14])
-            with cols[4]:
-                st.text(str(row.get('product', ''))[:10])
-            with cols[5]:
-                st.text(str(row.get('start_date', ''))[:10])
-            with cols[6]:
-                st.text(str(row.get('end_date', ''))[:10])
-            with cols[7]:
-                st.text(str(row.get('seconds', '')))
-            with cols[8]:
-                st.text(str(row.get('spots', '')))
-            with cols[9]:
-                st.text(str(int(row.get('amount_net', 0) or 0)))
-            with cols[10]:
-                if st.button("✏️ 編輯", key=f"edit_{row['id']}"):
-                    st.session_state["crud_edit_id"] = row['id']
+        st.markdown("**訂單清單（高效模式）**")
+        st.caption("使用搜尋與分頁瀏覽；只對選取的一筆做「編輯／刪除」，可支援大量資料。")
+
+        q1, q2, q3 = st.columns([2, 1, 1])
+        with q1:
+            crud_kw = st.text_input("搜尋（ID / 合約 / 客戶 / 產品 / 平台）", key="crud_kw", placeholder="輸入關鍵字")
+        with q2:
+            page_size = st.selectbox("每頁筆數", options=[20, 50, 100, 200], index=1, key="crud_page_size")
+        with q3:
+            sort_desc = st.checkbox("最新在前", value=True, key="crud_sort_desc")
+
+        df_list = df_orders_crud.copy()
+        if crud_kw and str(crud_kw).strip():
+            kw = str(crud_kw).strip().lower()
+            mask = (
+                df_list["id"].astype(str).str.lower().str.contains(kw, regex=False)
+                | df_list.get("contract_id", pd.Series([""] * len(df_list))).astype(str).str.lower().str.contains(kw, regex=False)
+                | df_list.get("client", pd.Series([""] * len(df_list))).astype(str).str.lower().str.contains(kw, regex=False)
+                | df_list.get("product", pd.Series([""] * len(df_list))).astype(str).str.lower().str.contains(kw, regex=False)
+                | df_list.get("platform", pd.Series([""] * len(df_list))).astype(str).str.lower().str.contains(kw, regex=False)
+            )
+            df_list = df_list[mask]
+
+        if "updated_at" in df_list.columns:
+            df_list = df_list.sort_values("updated_at", ascending=not sort_desc, na_position="last")
+        elif "id" in df_list.columns:
+            df_list = df_list.sort_values("id", ascending=not sort_desc, na_position="last")
+
+        total_rows = len(df_list)
+        total_pages = max(1, (total_rows + int(page_size) - 1) // int(page_size))
+        p1, p2 = st.columns([1, 3])
+        with p1:
+            page_no = st.number_input("頁碼", min_value=1, max_value=total_pages, value=1, step=1, key="crud_page_no")
+        with p2:
+            st.caption(f"共 {total_rows} 筆，{total_pages} 頁")
+
+        start = (int(page_no) - 1) * int(page_size)
+        end = start + int(page_size)
+        df_page = df_list.iloc[start:end].copy()
+        show_cols = [c for c in ["id", "contract_id", "platform", "client", "product", "start_date", "end_date", "seconds", "spots", "amount_net", "updated_at"] if c in df_page.columns]
+        st.dataframe(_styler_one_decimal(df_page[show_cols]), use_container_width=True, height=360, hide_index=True)
+
+        # 單筆操作：避免每列按鈕
+        options = df_page["id"].astype(str).tolist() if not df_page.empty else []
+        sel_id = st.selectbox("選取一筆訂單 ID", options=options, key="crud_select_id")
+        op1, op2 = st.columns(2)
+        with op1:
+            if st.button("✏️ 編輯所選", key="crud_btn_edit_selected", disabled=(not sel_id)):
+                st.session_state["crud_edit_id"] = sel_id
+                st.rerun()
+        with op2:
+            if st.button("🗑️ 刪除所選", key="crud_btn_del_selected", type="primary", disabled=(not sel_id)):
+                conn_del = get_db_connection()
+                try:
+                    conn_del.execute("DELETE FROM orders WHERE id=?", (sel_id,))
+                    conn_del.commit()
+                    df_after = pd.read_sql("SELECT * FROM orders", conn_del)
+                    conn_del.close()
+                    build_ad_flight_segments(df_after, load_platform_settings(), write_to_db=True, sync_sheets=False)
+                    _sync_sheets_if_enabled(only_tables=["Orders", "Segments"], skip_if_unchanged=True)
+                    if "crud_edit_id" in st.session_state and st.session_state.get("crud_edit_id") == sel_id:
+                        del st.session_state["crud_edit_id"]
+                    if '_table1_cache_key' in st.session_state:
+                        del st.session_state['_table1_cache_key']
+                    st.success("✅ 已刪除")
                     st.rerun()
-            with cols[11]:
-                if st.button("🗑️ 刪除", key=f"del_{row['id']}", type="primary"):
-                    conn_del = get_db_connection()
-                    try:
-                        conn_del.execute("DELETE FROM orders WHERE id=?", (row['id'],))
-                        conn_del.commit()
-                        df_after = pd.read_sql("SELECT * FROM orders", conn_del)
-                        conn_del.close()
-                        build_ad_flight_segments(df_after, load_platform_settings(), write_to_db=True)
-                        _sync_sheets_if_enabled()
-                        if "crud_edit_id" in st.session_state and st.session_state.get("crud_edit_id") == row['id']:
-                            del st.session_state["crud_edit_id"]
-                        if '_table1_cache_key' in st.session_state:
-                            del st.session_state['_table1_cache_key']
-                        st.success("✅ 已刪除")
-                        st.rerun()
-                    except Exception as e:
-                        conn_del.rollback()
-                        conn_del.close()
-                        st.error(f"刪除失敗: {e}")
-            st.markdown("---")
+                except Exception as e:
+                    conn_del.rollback()
+                    conn_del.close()
+                    st.error(f"刪除失敗: {e}")
 
 elif selected_tab == "📅 表2-秒數明細":
     st.markdown("### 📅 表2－秒數明細（對齊 Excel 表2）")
