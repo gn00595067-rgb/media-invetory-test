@@ -304,6 +304,45 @@ def render_ragic_test_tab(
 
                         cue_units = parse_cue_excel_for_table1(content, order_info=None)
                         ad_units = len(cue_units) if cue_units else 0
+                        if ad_units == 0:
+                            # 解析不到時，給出可行的「版型診斷」log，讓使用者知道 Excel 裡到底長什麼樣
+                            try:
+                                import datetime as _dt
+                                import openpyxl as _op
+                                import io as _io
+
+                                wb = _op.load_workbook(_io.BytesIO(content), data_only=True, read_only=True)
+                                for sname in wb.sheetnames[:10]:
+                                    ws = wb[sname]
+                                    date_like = 0
+                                    num_like = 0
+                                    samples = []
+                                    max_r = min(30, ws.max_row or 0)
+                                    max_c = min(18, ws.max_column or 0)
+                                    for r in range(1, max_r + 1):
+                                        row_vals = []
+                                        for c in range(1, max_c + 1):
+                                            v = ws.cell(row=r, column=c).value
+                                            if isinstance(v, (_dt.date, _dt.datetime)):
+                                                date_like += 1
+                                            elif isinstance(v, (int, float)) and v != 0:
+                                                num_like += 1
+                                            row_vals.append(v)
+                                        if r <= 8:
+                                            samples.append(row_vals[:10])
+                                    _log(f"[auto-parse][diag] sheet='{sname}' max_row={ws.max_row} max_col={ws.max_column} date_like={date_like} num_like(nonzero)={num_like}")
+                                    # 左上角抽樣（前 8x10），避免整份倒出太大
+                                    try:
+                                        preview = "\n".join([str(x) for x in samples])
+                                        _log(f"[auto-parse][diag] top_left_8x10 sheet='{sname}' => {preview}")
+                                    except Exception:
+                                        pass
+                                try:
+                                    wb.close()
+                                except Exception:
+                                    pass
+                            except Exception as e:
+                                _log(f"[auto-parse][diag] profile failed: {e}")
                         # 摘要：起迄日、總檔次（合計）
                         starts = [u.get("start_date") for u in cue_units if u.get("start_date")]
                         ends = [u.get("end_date") for u in cue_units if u.get("end_date")]
