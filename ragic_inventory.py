@@ -6237,7 +6237,7 @@ elif selected_tab == "🧪 Ragic抓取測試":
         if "_ragicId" in df.columns:
             _log(f"_ragicId notna count={int(df['_ragicId'].notna().sum())}")
             try:
-                _log(f\"_ragicId sample(head 5)={df['_ragicId'].head(5).tolist()}\")
+                _log(f"_ragicId sample(head 5)={df['_ragicId'].head(5).tolist()}")
             except Exception:
                 pass
         # 額外顯示 df 前幾列，確認為何看起來是空
