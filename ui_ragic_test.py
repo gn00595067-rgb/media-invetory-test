@@ -77,15 +77,39 @@ def render_ragic_test_tab(
 
     keyword = st.text_input("關鍵字（訂檔單號/客戶/產品/平台 任一包含）", value="")
 
-    def g(e: dict, name: str) -> str:
-        fid = ragic_fields.get(name)
-        if not fid:
+    def _normalize_cell(v: Any) -> str:
+        """將 Ragic 回傳的欄位值正規化成可顯示字串（list 轉以逗號串接）。"""
+        if v is None:
             return ""
-        return e.get(fid, "")
+        try:
+            if isinstance(v, float) and pd.isna(v):
+                return ""
+        except Exception:
+            pass
+        if isinstance(v, (list, tuple)):
+            return ", ".join([_normalize_cell(x) for x in v if _normalize_cell(x)])
+        if isinstance(v, dict):
+            # 避免整包 dict 直接印在表格上（可於原始回傳區查看）
+            return ""
+        return str(v).strip()
+
+    def g(e: dict, name: str) -> str:
+        """
+        取值策略（對齊實際回傳）：
+        - 優先用流水號欄位 id（如 1015325）
+        - 若 listing 回傳的是中文欄名（如「訂檔單號」），則改用欄名取值
+        """
+        fid = ragic_fields.get(name)
+        if fid and fid in e and e.get(fid) not in (None, ""):
+            return _normalize_cell(e.get(fid))
+        if name in e and e.get(name) not in (None, ""):
+            return _normalize_cell(e.get(name))
+        return ""
 
     def entry_to_row(e: dict):
         cue_fid = ragic_fields.get("訂檔CUE表")
-        cue_tokens = parse_file_tokens(e.get(cue_fid)) if cue_fid else []
+        cue_val = e.get(cue_fid) if cue_fid and cue_fid in e else e.get("訂檔CUE表")
+        cue_tokens = parse_file_tokens(cue_val)
         return {
             "_ragicId": e.get("_ragicId"),
             "訂檔單號": g(e, "訂檔單號"),
@@ -223,11 +247,12 @@ def render_ragic_test_tab(
         info = {}
         for k in show_fields:
             fid = ragic_fields.get(k)
-            info[k] = entry.get(fid) if fid else None
+            info[k] = entry.get(fid) if fid and fid in entry else entry.get(k)
         st.json(info)
 
         cue_fid = ragic_fields.get("訂檔CUE表")
-        cue_tokens = parse_file_tokens(entry.get(cue_fid)) if cue_fid else []
+        cue_val = entry.get(cue_fid) if cue_fid and cue_fid in entry else entry.get("訂檔CUE表")
+        cue_tokens = parse_file_tokens(cue_val)
         if not cue_tokens:
             st.info("此筆沒有「訂檔CUE表」檔案。")
         else:
