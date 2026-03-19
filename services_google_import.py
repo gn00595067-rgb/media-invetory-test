@@ -111,7 +111,31 @@ def sheet_row_to_order(row, row_index, col_map, normalize_seconds_type: Callable
         if not updated_at:
             updated_at = datetime.now().strftime("%Y-%m-%d")
         updated_at = updated_at + " 00:00:00" if len(updated_at) == 10 else updated_at
-    order_id = f"gs_{row_index}_{contract_id or row_index}_{platform}_{start_date}".replace(" ", "_")[:200]
+    # 重要：避免同一筆訂單在 Google Sheet 出現重複列時，因 `row_index`
+    # 造成 orders.id 不同而無法合併（INSERT OR REPLACE 也合併不起來）。
+    # 這個 stable_key 用到「定義該筆訂單」的核心欄位，讓重複列能覆蓋同一筆 orders。
+    import hashlib
+
+    stable_key = "|".join(
+        map(
+            str,
+            [
+                contract_id or "",
+                platform or "",
+                client or "",
+                product or "",
+                sales or "",
+                company or "",
+                start_date or "",
+                end_date or "",
+                seconds,
+                spots,
+                seconds_type or "",
+            ],
+        )
+    )
+    digest = hashlib.sha1(stable_key.encode("utf-8")).hexdigest()[:12]
+    order_id = f"gs_{contract_id or 'na'}_{start_date}_{end_date}_{digest}".replace(" ", "_")[:200]
 
     # 預先套用與 build_ad_flight_segments 相同的「可產生 segment 條件」
     # - seconds/spots 需 > 0

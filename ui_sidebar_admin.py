@@ -14,11 +14,13 @@ import streamlit as st
 def render_sidebar_admin(
     *,
     get_db_connection: Callable[[], object],
+    init_db: Callable[[], None],
     db_file: str,
     get_store_count: Callable[[str, dict], int],
     load_platform_settings: Callable[[], dict],
     platform_capacity: dict,
     save_platform_settings: Callable[[str, int, int], None],
+    sync_sheets_if_enabled: Callable[..., object],
 ) -> None:
     st.sidebar.markdown("---")
     if st.sidebar.button("🧨 重置資料庫（刪除並重建）", help="⚠️ 警告：這會刪除所有現有資料"):
@@ -28,6 +30,10 @@ def render_sidebar_admin(
             if os.path.exists(db_file):
                 os.remove(db_file)
                 st.sidebar.success("✅ 已刪除資料庫，將重新初始化")
+                # 先重建空資料庫，確保同步時讀到的是「空表」而不是舊檔
+                init_db()
+                # 同步到 Google Sheet，讓「清空 DB」也能清空試算表內容（避免 skip_if_unchanged 導致不更新）
+                sync_sheets_if_enabled(skip_if_unchanged=False)
                 time.sleep(1)
                 st.rerun()
             else:

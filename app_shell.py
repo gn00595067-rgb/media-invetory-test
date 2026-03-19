@@ -126,11 +126,13 @@ def run_app_shell(
     render_sidebar_ragic_import(import_ragic_to_orders_by_date_range=import_ragic_to_orders_by_date_range)
     render_sidebar_admin(
         get_db_connection=get_db_connection,
+        init_db=init_db,
         db_file=db_file,
         get_store_count=get_store_count,
         load_platform_settings=load_platform_settings,
         platform_capacity=platform_capacity,
         save_platform_settings=save_platform_settings,
+        sync_sheets_if_enabled=sync_sheets_if_enabled,
     )
 
     t0 = time.perf_counter()

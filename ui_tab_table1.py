@@ -42,13 +42,9 @@ def render_table1_tab(
     st.markdown("### 📋 表1－資料（訂單主表）")
     st.caption("此表對應 Excel：秒數管理表 → 表1-資料，為行政與業務對帳用之訂單主表。")
 
-    # 表1大表若依賴 segments 會牽涉到大量資料與運算；訂單逐筆管理其實可不依賴 segments。
-    # 預設採「不使用 segments」以確保啟動/切換分頁速度；需要更完整細節再手動切換。
-    use_segments = st.checkbox(
-        "使用檔次段（Segments，較慢）",
-        value=False,
-        key="table1_use_segments",
-    )
+    # 商業定義：表1本來就是要以 Segments（排程/檔次段）為主體口徑。
+    # 為避免 UI 語意錯置，移除切換勾選框，直接永遠使用 Segments。
+    use_segments = True
 
     table1_default_index = 0  # 為了速度：預設先不產生日/日期欄位（更接近 1s 體感）
     view_mode = st.radio(
@@ -134,13 +130,8 @@ def render_table1_tab(
     with col1:
         orders_count = len(df_orders)
         shown_rows = len(df_table1)
-        # 表1在 Segments 模式下會用 `ad_flight_segments` 建表，列數與 orders 不同。
-        # 這裡讓上方數字「對應你目前看到的表格列數」，避免語意錯置。
-        if use_segments:
-            st.metric("顯示列數(檔次段)", shown_rows)
-            st.caption(f"原始 orders 筆數={orders_count}")
-        else:
-            st.metric("訂單筆數", orders_count)
+        st.metric("檔次段(segments)數", shown_rows)
+        st.caption(f"來源 orders 筆數={orders_count}")
     with col2:
         st.metric("客戶數", df_table1["客戶"].nunique() if "客戶" in df_table1.columns else (df_table1["HYUNDAI_CUSTIN"].nunique() if "HYUNDAI_CUSTIN" in df_table1.columns else 0))
     with col3:
@@ -154,11 +145,7 @@ def render_table1_tab(
         total_amount = df_table1["實收金額"].sum() if "實收金額" in df_table1.columns else 0
         st.metric("實收金額總計", f"{total_amount:,}")
 
-    if use_segments:
-        # 這段用來解釋「為什麼訂單筆數只有 178 / 為什麼你看到的列數和 orders 不一致」
-        st.caption(
-            f"目前啟用 Segments 模式：表1顯示列數={len(df_table1)}（檔次段列數；不等同 orders 筆數）。"
-        )
+    # 不再需要提示「Segments 模式切換」，因為 Table1 永遠使用 Segments。
 
     with st.expander("🔍 篩選條件", expanded=False):
         c1, c2, c3 = st.columns(3)
