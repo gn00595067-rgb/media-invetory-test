@@ -53,6 +53,7 @@ def render_main_tabs(
     set_platform_monthly_purchase: Callable[..., object],
     get_ragic_import_logs: Callable[..., object],
     parse_cue_excel_for_table1: Callable[..., object],
+    import_ragic_single_entry_to_orders: Callable[..., object],
     build_daily_inventory_and_metrics: Callable[..., object],
     seconds_to_spot_label: Callable[..., str],
     calculate_roi_by_period: Callable[..., object],
@@ -158,6 +159,7 @@ def render_main_tabs(
             ragic_fields=ragic_fields,
             ragic_subtable_fields=ragic_subtable_fields if ragic_subtable_fields else {},
             parse_cue_excel_for_table1=parse_cue_excel_for_table1,
+            import_ragic_single_entry_to_orders=import_ragic_single_entry_to_orders,
         )
     elif selected_tab == "🧪 實驗分頁":
         from ui_tab_experiment import render_experiment_tab

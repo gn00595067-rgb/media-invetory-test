@@ -522,6 +522,31 @@ def import_ragic_to_orders_by_date_range(
     )
 
 
+def import_ragic_single_entry_to_orders(
+    ragic_url: str,
+    api_key: str,
+    ragic_id: str | int,
+    replace_existing: bool = False,
+):
+    from services_ragic_import import import_ragic_single_entry_to_orders_service
+
+    return import_ragic_single_entry_to_orders_service(
+        ragic_url=ragic_url,
+        api_key=api_key,
+        ragic_id=ragic_id,
+        replace_existing=replace_existing,
+        ragic_fields=RAGIC_FIELDS,
+        parse_cue_excel_for_table1=parse_cue_excel_for_table1,
+        get_db_connection=get_db_connection,
+        init_db=init_db,
+        build_ad_flight_segments=build_ad_flight_segments,
+        load_platform_settings=load_platform_settings,
+        compute_and_save_split_amount_for_contract=_compute_and_save_split_amount_for_contract,
+        sync_sheets_if_enabled=_sync_sheets_if_enabled,
+        normalize_date=_normalize_date,
+    )
+
+
 def get_ragic_import_logs(limit=1000):
     """讀取 Ragic 匯入紀錄（最新在前）。"""
     from services_ragic_import import get_ragic_import_logs_service
@@ -832,6 +857,7 @@ run_app_shell(
     sync_sheets_if_enabled=_sync_sheets_if_enabled,
     import_google_sheet_to_orders=import_google_sheet_to_orders,
     import_ragic_to_orders_by_date_range=import_ragic_to_orders_by_date_range,
+    import_ragic_single_entry_to_orders=import_ragic_single_entry_to_orders,
     load_platform_settings=load_platform_settings,
     load_orders_cached=_load_orders_cached,
     load_segments_cached=_load_segments_cached,

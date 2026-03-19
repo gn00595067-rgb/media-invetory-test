@@ -11,6 +11,7 @@ def render_ragic_test_entry(
     ragic_fields: Dict,
     ragic_subtable_fields: Dict,
     parse_cue_excel_for_table1: Callable[..., object],
+    import_ragic_single_entry_to_orders: Callable[..., object],
 ) -> None:
     from ui_ragic_test import render_ragic_test_tab
 
@@ -20,5 +21,6 @@ def render_ragic_test_entry(
     render_ragic_test_tab(
         ragic_fields=merged,
         parse_cue_excel_for_table1=parse_cue_excel_for_table1,
+        import_ragic_single_entry_to_orders=import_ragic_single_entry_to_orders,
     )
 

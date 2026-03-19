@@ -112,6 +112,23 @@ def sheet_row_to_order(row, row_index, col_map, normalize_seconds_type: Callable
             updated_at = datetime.now().strftime("%Y-%m-%d")
         updated_at = updated_at + " 00:00:00" if len(updated_at) == 10 else updated_at
     order_id = f"gs_{row_index}_{contract_id or row_index}_{platform}_{start_date}".replace(" ", "_")[:200]
+
+    # 預先套用與 build_ad_flight_segments 相同的「可產生 segment 條件」
+    # - seconds/spots 需 > 0
+    # - platform 經 parse 後必須是全家/家樂福
+    # - start/end 需可解析成日期
+    if seconds <= 0 or spots <= 0:
+        return None
+    try:
+        from services_media_platform import parse_platform_region as _parse_platform_region
+
+        parsed_platform, _, _ = _parse_platform_region(platform)
+        if parsed_platform not in ["全家", "家樂福"]:
+            return None
+        if pd.isna(pd.to_datetime(start_date, errors="coerce")) or pd.isna(pd.to_datetime(end_date, errors="coerce")):
+            return None
+    except Exception:
+        return None
     return (
         order_id,
         platform,

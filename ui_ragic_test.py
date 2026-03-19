@@ -509,6 +509,7 @@ def render_ragic_test_tab(
     *,
     ragic_fields: dict[str, str],
     parse_cue_excel_for_table1: Callable[[bytes, Any], list[dict]],
+    import_ragic_single_entry_to_orders: Callable[..., object] | None = None,
     **kwargs: Any,
 ) -> None:
     """kwargs 可含 build_table1_from_cue_excel, load_platform_settings（相容舊版僅傳 2 參數）。"""
@@ -628,6 +629,28 @@ def render_ragic_test_tab(
     rid = entry.get("_ragicId", "")
     st.markdown("---")
     st.markdown(f"#### 📌 案子：_ragicId = {rid}")
+
+    if import_ragic_single_entry_to_orders:
+        st.caption("可將這筆單一 Ragic 案子匯入至 `orders` / `segments`（無法產生 segment 的列會被略過並寫入匯入紀錄）。")
+        ragic_replace_single = st.checkbox("匯入時取代現有資料", value=False, key="ragic_import_replace_single")
+        api_key_use = api_key_input or api_key
+        if st.button("📥 匯入此單筆到資料庫", type="primary", key="ragic_import_single_btn") and (str(ragic_url or "").strip()):
+            if not api_key_use or not str(api_key_use).strip():
+                st.error("請輸入 Ragic API Key。")
+                st.stop()
+            with st.spinner("正在匯入（抓取附檔、解析 CUE、寫入 orders/segments）..."):
+                ok, msg, batch_id = import_ragic_single_entry_to_orders(
+                    ragic_url=ragic_url.strip(),
+                    api_key=str(api_key_use).strip(),
+                    ragic_id=rid,
+                    replace_existing=ragic_replace_single,
+                )
+            if ok:
+                st.success(msg)
+                st.session_state["_ragic_last_batch_id"] = batch_id
+                st.rerun()
+            else:
+                st.error(msg)
 
     # 一、Ragic 完整欄位（超詳盡）
     st.markdown("##### 一、Ragic 完整欄位（所有抓到的欄位）")

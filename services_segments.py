@@ -68,47 +68,49 @@ def build_ad_flight_segments(
             except Exception:
                 continue
     df_segments = pd.DataFrame(segments)
-    if write_to_db and not df_segments.empty:
+    if write_to_db:
         conn = get_db_connection_fn()
         c = conn.cursor()
         try:
             c.execute("BEGIN TRANSACTION")
+            # 無論是否產出 segments，都先清掉舊資料，避免「orders 增加但 segments 還停留在舊匯入」。
             c.execute("DELETE FROM ad_flight_segments")
-            c.executemany(
-                """
-                INSERT INTO ad_flight_segments
-                (segment_id, source_order_id, platform, channel, region, media_platform, company, sales,
-                 client, product, seconds, spots, start_date, end_date, duration_days,
-                 store_count, total_spots, total_store_seconds, seconds_type, created_at, updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-                [
-                    (
-                        seg["segment_id"],
-                        seg["source_order_id"],
-                        seg["platform"],
-                        seg["channel"],
-                        seg["region"],
-                        seg.get("media_platform", ""),
-                        seg["company"],
-                        seg["sales"],
-                        seg["client"],
-                        seg["product"],
-                        seg["seconds"],
-                        seg["spots"],
-                        seg["start_date"],
-                        seg["end_date"],
-                        seg["duration_days"],
-                        seg["store_count"],
-                        seg["total_spots"],
-                        seg["total_store_seconds"],
-                        seg["seconds_type"],
-                        seg["created_at"],
-                        seg["updated_at"],
-                    )
-                    for seg in segments
-                ],
-            )
+            if not df_segments.empty:
+                c.executemany(
+                    """
+                    INSERT INTO ad_flight_segments
+                    (segment_id, source_order_id, platform, channel, region, media_platform, company, sales,
+                     client, product, seconds, spots, start_date, end_date, duration_days,
+                     store_count, total_spots, total_store_seconds, seconds_type, created_at, updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                    [
+                        (
+                            seg["segment_id"],
+                            seg["source_order_id"],
+                            seg["platform"],
+                            seg["channel"],
+                            seg["region"],
+                            seg.get("media_platform", ""),
+                            seg["company"],
+                            seg["sales"],
+                            seg["client"],
+                            seg["product"],
+                            seg["seconds"],
+                            seg["spots"],
+                            seg["start_date"],
+                            seg["end_date"],
+                            seg["duration_days"],
+                            seg["store_count"],
+                            seg["total_spots"],
+                            seg["total_store_seconds"],
+                            seg["seconds_type"],
+                            seg["created_at"],
+                            seg["updated_at"],
+                        )
+                        for seg in segments
+                    ],
+                )
             conn.commit()
             conn.close()
             if sync_sheets:
