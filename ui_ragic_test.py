@@ -130,6 +130,10 @@ def _entry_to_order_info(entry: dict, ragic_fields: dict[str, str]) -> dict:
     }
 
 
+# 常見附檔副檔名（Ragic 附檔 token 常為 ...@xxx.副檔名）
+FILE_EXTENSIONS = (".xlsx", ".xls", ".pdf", ".jpg", ".jpeg", ".png", ".doc", ".docx", ".csv")
+
+
 def _deep_collect_excel_tokens(val: Any) -> list[str]:
     out: list[str] = []
     if val is None:
@@ -148,6 +152,42 @@ def _deep_collect_excel_tokens(val: Any) -> list[str]:
             out.extend(_deep_collect_excel_tokens(x))
         return out
     return out
+
+
+def _deep_collect_all_file_tokens(val: Any) -> list[str]:
+    """從 entry 遞迴收集所有附檔 token（Excel、PDF、圖片等）。"""
+    out: list[str] = []
+    if val is None:
+        return out
+    if isinstance(val, str):
+        s = val.strip()
+        if "@" in s and s.lower().endswith(FILE_EXTENSIONS):
+            out.append(s)
+        return out
+    if isinstance(val, (list, tuple)):
+        for x in val:
+            out.extend(_deep_collect_all_file_tokens(x))
+        return out
+    if isinstance(val, dict):
+        for x in val.values():
+            out.extend(_deep_collect_all_file_tokens(x))
+        return out
+    return out
+
+
+def _suggest_filename(token: str, index: int) -> str:
+    """從 Ragic token 推測下載檔名（token 常含 @ 後接檔名）。"""
+    s = (token or "").strip()
+    if "@" in s:
+        part = s.split("@")[-1].strip()
+        if part and "." in part:
+            return part
+    ext = ".bin"
+    for e in FILE_EXTENSIONS:
+        if s.lower().endswith(e):
+            ext = e
+            break
+    return f"附檔_{index + 1}{ext}"
 
 
 def _create_pdf_bytes(ragic_rows: list[dict], table1_df: pd.DataFrame, title: str) -> bytes:
@@ -472,8 +512,51 @@ def render_ragic_test_tab(
             " 抓不到或無法判斷的資料已顯示為「無法判斷」或「抓不到」。請使用橫向滾動查看完整內容。"
         )
 
-    # 下載 Excel
-    st.markdown("##### 📥 下載")
+    # ---------- 下載 Ragic 上的附檔（原始 Excel / PDF 等）----------
+    st.markdown("##### 📥 下載 Ragic 附檔（原始檔案）")
+    _raw_tokens = _deep_collect_all_file_tokens(entry)
+    seen: set[str] = set()
+    all_file_tokens = [t for t in _raw_tokens if t not in seen and not seen.add(t)]
+    if not all_file_tokens:
+        st.caption("此筆 Ragic 沒有偵測到附檔（訂檔CUE表或其他欄位）。")
+    elif not api_key_use:
+        st.caption("請設定 Ragic API Key 才能下載附檔。")
+    else:
+        cache_key = f"_ragic_attach_cache_{rid}"
+        if cache_key not in st.session_state:
+            st.session_state[cache_key] = {}
+        cache = st.session_state[cache_key]
+
+        if st.button("🔄 載入附檔列表（從 Ragic 下載）", key="ragic_load_attachments"):
+            prog = st.progress(0)
+            for i, tok in enumerate(all_file_tokens):
+                content, err = download_file(ref, tok, api_key_use, timeout=120)
+                cache[tok] = (content, err)
+                prog.progress((i + 1) / len(all_file_tokens))
+            st.rerun()
+
+        if cache:
+            for i, tok in enumerate(all_file_tokens):
+                content, err = cache.get(tok, (None, None))
+                fname = _suggest_filename(tok, i)
+                if err or content is None:
+                    st.caption(f"附檔 {i + 1} `{fname}`：{err or '下載失敗'}")
+                else:
+                    mime = "application/octet-stream"
+                    if fname.lower().endswith(".pdf"):
+                        mime = "application/pdf"
+                    elif fname.lower().endswith((".xlsx", ".xls")):
+                        mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if fname.lower().endswith(".xlsx") else "application/vnd.ms-excel"
+                    st.download_button(
+                        f"📎 下載附檔 {i + 1}：{fname}",
+                        data=content,
+                        file_name=fname,
+                        mime=mime,
+                        key=f"dl_ragic_attach_{rid}_{i}",
+                    )
+
+    # ---------- 下載本頁報告（Ragic 欄位＋表1 解析產生的 Excel/PDF）----------
+    st.markdown("##### 📥 下載本頁報告（Excel / PDF）")
     if not ragic_rows:
         ragic_rows = [{"欄位ID": k, "欄位名稱": k, "值": _normalize_cell(v)} for k, v in entry.items()]
     df_ragic_export = pd.DataFrame(ragic_rows)
@@ -485,29 +568,32 @@ def render_ragic_test_tab(
             df_combined.to_excel(w, sheet_name="表1-解析明細", index=False)
     excel_buf.seek(0)
     st.download_button(
-        "📥 下載 Excel（Ragic 欄位 + 表1 解析明細）",
+        "📥 下載本頁報告 Excel（Ragic 欄位 + 表1 解析明細）",
         data=excel_buf.getvalue(),
         file_name=f"ragic_case_{rid}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key="dl_ragic_excel",
     )
 
-    # 下載 PDF
     try:
         pdf_bytes = _create_pdf_bytes(ragic_rows, df_combined, f"Ragic 案子 {rid} 詳盡解析")
         st.download_button(
-            "📥 下載 PDF（Ragic 欄位 + 表1 摘要）",
+            "📥 下載本頁報告 PDF（Ragic 欄位 + 表1 摘要）",
             data=pdf_bytes,
             file_name=f"ragic_case_{rid}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
             mime="application/pdf",
             key="dl_ragic_pdf",
         )
     except Exception as e:
-        st.caption(f"PDF 產生失敗：{e}（請確認已安裝 reportlab）")
+        st.caption(f"本頁報告 PDF 產生失敗：{e}（請確認已安裝 reportlab）")
 
     if st.button("清除目前案子", key="ragic_clear_entry"):
         if "_ragic_last_entry" in st.session_state:
             del st.session_state["_ragic_last_entry"]
         if "_ragic_search_results" in st.session_state:
             del st.session_state["_ragic_search_results"]
+        try:
+            del st.session_state[f"_ragic_attach_cache_{rid}"]
+        except KeyError:
+            pass
         st.rerun()
