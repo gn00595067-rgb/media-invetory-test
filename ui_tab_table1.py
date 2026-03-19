@@ -175,61 +175,114 @@ def render_table1_tab(
                 ]
 
             st.caption(f"可編輯 segments 筆數：{len(df_seg_editor)}")
-            show_df = df_seg_editor.head(200).copy()
-            if not show_df.empty:
-                show_df["segment_id_short"] = show_df["segment_id"].astype(str).str[:8]
-                show_cols = [c for c in ["segment_id_short", "segment_id", "seconds_type", "company", "sales", "client", "platform", "region", "start_date", "end_date"] if c in show_df.columns]
-                st.dataframe(
-                    show_df[show_cols],
-                    use_container_width=True,
-                    hide_index=True,
-                    height=320,
-                )
-
-            # 套用編輯：用 selectbox 選 segment_id（比整張 data_editor 更穩、也更快）
-            if not df_seg_editor.empty:
-                seg_id_options = df_seg_editor["segment_id"].astype(str).tolist()
-                seg_id_selected = st.selectbox("選擇要編輯的 segment_id", seg_id_options, key="seg_edit_segment_id")
-                current_stype = ""
+            # 為了讓資訊更接近表1「最詳細」的對帳口徑：把對得上的合約編號一起帶出來（若有）
+            df_for_edit = df_seg_editor
+            if (
+                not df_for_edit.empty
+                and not df_orders.empty
+                and "source_order_id" in df_for_edit.columns
+                and "id" in df_orders.columns
+                and "contract_id" in df_orders.columns
+            ):
                 try:
-                    cur_row = df_seg_editor[df_seg_editor["segment_id"].astype(str) == str(seg_id_selected)]
-                    if not cur_row.empty:
-                        current_stype = str(cur_row.iloc[0].get("seconds_type", "") or "")
+                    orders_contract = df_orders[["id", "contract_id"]].copy()
+                    orders_contract["id"] = orders_contract["id"].astype(str)
+                    df_for_edit = df_for_edit.copy()
+                    df_for_edit["source_order_id"] = df_for_edit["source_order_id"].astype(str)
+                    df_for_edit = df_for_edit.merge(
+                        orders_contract,
+                        left_on="source_order_id",
+                        right_on="id",
+                        how="left",
+                        suffixes=("", "_order"),
+                    )
+                    if "contract_id" in df_for_edit.columns:
+                        df_for_edit = df_for_edit.rename(columns={"contract_id": "合約編號"})
                 except Exception:
-                    current_stype = ""
+                    # 對帳欄位可用就好，失敗不影響主流程
+                    pass
 
-                new_seconds_type = st.selectbox(
-                    "新的秒數用途(seconds_type)",
-                    options=list(seconds_usage_types),
-                    index=list(seconds_usage_types).index(current_stype) if current_stype in seconds_usage_types else 0,
-                    key="seg_edit_new_seconds_type",
-                )
+            show_df = df_for_edit.head(200).copy()
+            if show_df.empty:
+                st.info("符合條件但沒有可顯示的 records（顯示上限 200 筆）。")
+                st.stop()
 
-                auto_sync = st.checkbox("套用後立即同步 Google Sheet", value=True, key="seg_edit_auto_sync")
-                if st.button("套用並同步", type="primary", disabled=not seg_id_selected, key="seg_edit_apply_sync"):
-                    now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    conn_upd = get_db_connection()
-                    try:
-                        conn_upd.execute(
-                            "UPDATE ad_flight_segments SET seconds_type=?, updated_at=? WHERE segment_id=?",
-                            (new_seconds_type, now_ts, seg_id_selected),
-                        )
-                        conn_upd.commit()
-                    except Exception as e:
-                        conn_upd.rollback()
-                        conn_upd.close()
-                        st.error(f"Segments seconds_type 更新失敗：{e}")
-                        st.stop()
+            show_df["選取"] = False
+            show_df["segment_id_short"] = show_df["segment_id"].astype(str).str[:8]
+
+            # 顯示欄位：盡量對齊表1常用對帳欄（Segments 本身沒有小時/每日欄位，所以用 segments 可用的詳細度）
+            desired_cols = [
+                "選取",
+                "segment_id_short",
+                "segment_id",
+                "合約編號",
+                "source_order_id",
+                "seconds_type",
+                "company",
+                "sales",
+                "client",
+                "platform",
+                "channel",
+                "region",
+                "media_platform",
+                "start_date",
+                "end_date",
+                "seconds",
+                "spots",
+                "duration_days",
+                "store_count",
+                "total_spots",
+                "total_store_seconds",
+                "updated_at",
+            ]
+            show_cols = [c for c in desired_cols if c in show_df.columns]
+            disabled_cols = [c for c in show_cols if c != "選取"]
+
+            edited_df = st.data_editor(
+                show_df[show_cols],
+                column_config={
+                    "選取": st.column_config.CheckboxColumn("選取"),
+                },
+                disabled=disabled_cols,
+                hide_index=True,
+                height=360,
+                key="seg_multi_edit_table",
+            )
+
+            new_seconds_type = st.selectbox(
+                "新的秒數用途(seconds_type)",
+                options=list(seconds_usage_types),
+                index=0,
+                key="seg_multi_edit_new_seconds_type",
+            )
+
+            auto_sync = st.checkbox("套用後立即同步 Google Sheet", value=True, key="seg_multi_edit_auto_sync")
+            seg_id_selected_list = edited_df.loc[edited_df["選取"] == True, "segment_id"].astype(str).tolist() if "segment_id" in edited_df.columns else []
+
+            if st.button("批次套用並同步", type="primary", disabled=len(seg_id_selected_list) == 0, key="seg_multi_edit_apply_sync"):
+                now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                conn_upd = get_db_connection()
+                try:
+                    conn_upd.executemany(
+                        "UPDATE ad_flight_segments SET seconds_type=?, updated_at=? WHERE segment_id=?",
+                        [(new_seconds_type, now_ts, seg_id) for seg_id in seg_id_selected_list],
+                    )
+                    conn_upd.commit()
+                except Exception as e:
+                    conn_upd.rollback()
                     conn_upd.close()
+                    st.error(f"Segments seconds_type 批次更新失敗：{e}")
+                    st.stop()
+                conn_upd.close()
 
-                    if auto_sync:
-                        errs = sync_sheets_if_enabled(only_tables=["Segments"], skip_if_unchanged=False)
-                        if errs:
-                            st.error("Google Sheet 同步失敗：" + "; ".join(errs[:5]))
-                    if "_table1_cache_key" in st.session_state:
-                        del st.session_state["_table1_cache_key"]
-                    st.success("✅ 已更新 segments 的 seconds_type。")
-                    st.rerun()
+                if auto_sync:
+                    errs = sync_sheets_if_enabled(only_tables=["Segments"], skip_if_unchanged=False)
+                    if errs:
+                        st.error("Google Sheet 同步失敗：" + "; ".join(errs[:5]))
+                if "_table1_cache_key" in st.session_state:
+                    del st.session_state["_table1_cache_key"]
+                st.success(f"✅ 已批次更新 {len(seg_id_selected_list)} 筆 segments 的 seconds_type。")
+                st.rerun()
 
     with st.expander("🔍 篩選條件", expanded=False):
         c1, c2, c3 = st.columns(3)
