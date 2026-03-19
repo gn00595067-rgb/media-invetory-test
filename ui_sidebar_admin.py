@@ -32,10 +32,22 @@ def render_sidebar_admin(
                 st.sidebar.success("✅ 已刪除資料庫，將重新初始化")
                 # 先重建空資料庫，確保同步時讀到的是「空表」而不是舊檔
                 init_db()
-                # 同步到 Google Sheet，讓「清空 DB」也能清空試算表內容（避免 skip_if_unchanged 導致不更新）
+                # 同步到 Google Sheet，讓「清空 DB」也能清空試算表內容
+                try:
+                    from sheets_backend import is_sheets_enabled
+
+                    if not is_sheets_enabled():
+                        st.sidebar.warning("Google Sheet 未啟用或未設定：跳過同步。")
+                        st.session_state["_sheets_restored"] = True
+                        time.sleep(1)
+                        st.rerun()
+                except Exception:
+                    # is_sheets_enabled 失敗但同步可能仍可用，仍繼續嘗試同步
+                    pass
+
                 errs = sync_sheets_if_enabled(skip_if_unchanged=False)
                 if errs:
-                    st.sidebar.error("Google Sheet 同步失敗：" + "; ".join(errs[:3]))
+                    st.sidebar.error("Google Sheet 同步失敗：" + "; ".join(errs[:5]))
                 else:
                     st.sidebar.success("✅ Google Sheet 也已同步（空表覆蓋）")
                 # 避免 app 重新啟動時又立刻從 Sheet 把資料灌回 DB
