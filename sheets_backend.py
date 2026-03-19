@@ -23,6 +23,20 @@ WS_USERS = "Users"
 
 ALL_WORKHEET_NAMES = [WS_ORDERS, WS_SEGMENTS, WS_PLATFORM_SETTINGS, WS_CAPACITY, WS_PURCHASE, WS_USERS]
 
+# 試算表與檔案存取權限（與 stockanalysis 一致，避免權限不足）
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.file",
+]
+
+# 供同步失敗時顯示 _client() 無法連線的具體原因
+_last_client_error: str | None = None
+
+
+def get_last_client_error() -> str | None:
+    """回傳最近一次 _client() 失敗的原因（若無則 None）。"""
+    return _last_client_error
+
 
 def _get_sheet_config() -> dict[str, Any]:
     """從 Streamlit secrets 或環境變數取得設定。"""
@@ -87,24 +101,33 @@ def _get_credentials():
             try:
                 gs = dict(raw_gs)
             except (TypeError, ValueError):
-                gs = {k: getattr(raw_gs, k, None) for k in ("credentials", "credentials_json", "client_email", "private_key", "project_id", "private_key_id", "client_id") if getattr(raw_gs, k, None) is not None}
+                gs = {k: getattr(raw_gs, k, None) for k in ("credentials", "credentials_json", "credentials_b64", "client_email", "private_key", "project_id", "private_key_id", "client_id") if getattr(raw_gs, k, None) is not None}
     except Exception:
         gs = {}
     cred_dict = gs.get("credentials")
     if isinstance(cred_dict, dict):
         from google.oauth2 import service_account
-        return service_account.Credentials.from_service_account_info(cred_dict)
-    raw = gs.get("credentials_json") or os.environ.get("GOOGLE_SHEET_CREDENTIALS")
+        return service_account.Credentials.from_service_account_info(cred_dict, scopes=SCOPES)
+    raw = gs.get("credentials_json") or gs.get("credentials_b64") or os.environ.get("GOOGLE_SHEET_CREDENTIALS") or os.environ.get("GOOGLE_SHEET_CREDENTIALS_B64")
     if raw:
         if isinstance(raw, str):
-            try:
-                cred_dict = json.loads(raw)
-            except Exception:
-                return None
+            s = raw.strip()
+            if s.startswith("{"):
+                try:
+                    cred_dict = json.loads(s)
+                except json.JSONDecodeError:
+                    return None
+            else:
+                try:
+                    import base64
+                    decoded = base64.b64decode(s).decode("utf-8")
+                    cred_dict = json.loads(decoded)
+                except Exception:
+                    return None
         else:
             cred_dict = raw
         from google.oauth2 import service_account
-        return service_account.Credentials.from_service_account_info(cred_dict)
+        return service_account.Credentials.from_service_account_info(cred_dict, scopes=SCOPES)
     # 個別欄位（方便在 TOML 裡填；Cloud 多行 private_key 易出錯，建議改用 credentials_json）
     client_email = (gs.get("client_email") or os.environ.get("GOOGLE_SHEET_CLIENT_EMAIL") or "").strip()
     raw_key = gs.get("private_key") or os.environ.get("GOOGLE_SHEET_PRIVATE_KEY") or ""
@@ -125,7 +148,7 @@ def _get_credentials():
             "token_uri": "https://oauth2.googleapis.com/token",
             "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
             "client_x509_cert_url": "",
-        })
+        }, scopes=SCOPES)
     return None
 
 
@@ -158,18 +181,33 @@ def _get_sheet_id() -> str | None:
 
 
 def _client():
-    """取得 gspread 客戶端，失敗回傳 None。"""
+    """取得 gspread 客戶端，失敗回傳 None，並設定 _last_client_error 供 UI 顯示原因。"""
+    global _last_client_error
+    _last_client_error = None
     if not is_sheets_enabled():
+        _last_client_error = "Google Sheet 未啟用或設定不完整"
         return None
     creds = _get_credentials()
     sheet_id = _get_sheet_id()
-    if not creds or not sheet_id:
+    if not creds:
+        _last_client_error = "無法載入憑證（請檢查 Secrets 的 client_email / private_key 或 credentials_json）"
+        return None
+    if not sheet_id:
+        _last_client_error = "未填 sheet_id（請在 Secrets 的 [google_sheet] 填寫 sheet_id）"
         return None
     try:
         import gspread
         gc = gspread.authorize(creds)
-        return gc.open_by_key(sheet_id)
-    except Exception:
+        sh = gc.open_by_key(sheet_id)
+        return sh
+    except Exception as e:
+        err = str(e).strip()
+        if "403" in err or "permission" in err.lower() or "權限" in err or "does not have permission" in err.lower():
+            _last_client_error = "試算表未分享給服務帳戶：請在 Google 試算表按「共用」，加入 Secrets 裡的 client_email（例如 xxx@xxx.iam.gserviceaccount.com）為編輯者。"
+        elif "404" in err or "not found" in err.lower():
+            _last_client_error = "找不到試算表：請確認 sheet_id 是否正確，且試算表已分享給服務帳戶。"
+        else:
+            _last_client_error = err or "無法連線至 Google Sheet"
         return None
 
 
@@ -390,6 +428,10 @@ def sync_db_to_sheets(get_db_connection) -> list[str]:
                 errors.append(f"{name}: {e}")
     finally:
         conn.close()
+    # 若有錯誤且 _client() 有留下具體原因，放在第一則讓使用者看到
+    reason = get_last_client_error()
+    if errors and reason:
+        errors.insert(0, reason)
     return errors
 
 
