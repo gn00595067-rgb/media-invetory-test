@@ -5114,9 +5114,16 @@ if _tab_hint in _tabs_need_orders and df_orders.empty:
 # 重新載入設定（確保最新）
 custom_settings = load_platform_settings()
 
-# 分頁懶載入：只有需要庫存/檔次資料的分頁才載入 segments/daily（降低切頁卡頓）
-_tabs_need_segments_daily = {
+# 分頁懶載入：拆分 segments 與 daily，避免表1切換時不必要的 daily 展開
+_tabs_need_segments = {
     "📋 表1-資料",
+    "📅 表2-秒數明細",
+    "📉 總結表圖表",
+    "📊 分公司×媒體 每月秒數",
+    "📊 ROI",
+    "🧪 實驗分頁",
+}
+_tabs_need_daily = {
     "📅 表2-秒數明細",
     "📉 總結表圖表",
     "📊 分公司×媒體 每月秒數",
@@ -5125,17 +5132,19 @@ _tabs_need_segments_daily = {
 }
 df_seg_main = pd.DataFrame()
 df_daily = pd.DataFrame()
-if _tab_hint in _tabs_need_segments_daily:
+if _tab_hint in _tabs_need_segments:
     df_seg_main = _load_segments_cached(_db_mtime)
-    df_daily = _explode_segments_to_daily_cached(df_seg_main) if not df_seg_main.empty else pd.DataFrame()
-    # 如果 segments 表為空，嘗試建立（只在需要的分頁進行）
-    if df_daily.empty and not df_orders.empty:
+    if _tab_hint in _tabs_need_daily:
+        df_daily = _explode_segments_to_daily_cached(df_seg_main) if not df_seg_main.empty else pd.DataFrame()
+    # 如果 segments 表為空，嘗試建立（只在需要 segments 的分頁進行）
+    if df_seg_main.empty and not df_orders.empty:
         with st.spinner("正在建立檔次段..."):
             build_ad_flight_segments(df_orders, custom_settings, write_to_db=True, sync_sheets=False)
             _db_mtime = os.path.getmtime(DB_FILE) if os.path.exists(DB_FILE) else _db_mtime
             st.session_state['_db_mtime'] = _db_mtime
             df_seg_main = _load_segments_cached(_db_mtime)
-            df_daily = _explode_segments_to_daily_cached(df_seg_main) if not df_seg_main.empty else pd.DataFrame()
+            if _tab_hint in _tabs_need_daily:
+                df_daily = _explode_segments_to_daily_cached(df_seg_main) if not df_seg_main.empty else pd.DataFrame()
 
 # --- 分頁呈現（角色導向入口 + 只渲染當前分頁）---
 TAB_OPTIONS = ["📋 表1-資料", "📅 表2-秒數明細", "📊 表3-每日庫存", "📉 總結表圖表", "📊 分公司×媒體 每月秒數", "📋 媒體秒數與採購", "📊 ROI", "🧾 Ragic匯入紀錄", "🧪 Ragic抓取測試", "🧪 實驗分頁"]
