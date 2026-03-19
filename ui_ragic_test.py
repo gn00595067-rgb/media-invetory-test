@@ -282,6 +282,62 @@ def render_ragic_test_tab(
         )
         if listing_excel_rows:
             st.dataframe(pd.DataFrame(listing_excel_rows), use_container_width=True, hide_index=True)
+            st.markdown("#### ④ 自動解析（本次掃描到的 Excel）")
+            st.caption("會依掃描到的 token 逐一下載並解析；結果與錯誤都會寫入 Debug Log。")
+
+            max_files = st.number_input("本次最多自動解析檔案數", min_value=1, max_value=200, value=min(20, len(listing_excel_rows)), step=5)
+            auto_parse = st.checkbox("自動下載並解析掃描到的 Excel", value=True, help="關閉可只看掃描結果，不下載檔案。")
+            parsed_rows = []
+            if auto_parse:
+                # 展平成檔案清單（保留對應 ragicId/訂檔單號）
+                file_jobs = []
+                for r in listing_excel_rows:
+                    toks = r.get("excel_tokens(head3)") or []
+                    # head3 只顯示前三個，這裡先解析可見 token；若日後需要完整 token，可改為存 full list
+                    for tok in toks:
+                        file_jobs.append({"_ragicId": r.get("_ragicId"), "訂檔單號": r.get("訂檔單號"), "token": tok})
+                file_jobs = file_jobs[: int(max_files)]
+
+                prog = st.progress(0)
+                for idx, job in enumerate(file_jobs):
+                    tok = job["token"]
+                    _log(f"[auto-parse] download token={tok}")
+                    content, derr = download_file(ref, tok, api_key, timeout=180)
+                    if derr or not content:
+                        _log(f"[auto-parse] download failed token={tok} err={derr}")
+                        parsed_rows.append({**job, "status": "download_failed", "error": derr or "empty content", "ad_units": 0})
+                        prog.progress(int((idx + 1) / max(1, len(file_jobs)) * 100))
+                        continue
+                    try:
+                        cue_units = parse_cue_excel_for_table1(content, order_info=None)
+                        ad_units = len(cue_units) if cue_units else 0
+                        # 摘要：起迄日、總檔次（合計）
+                        starts = [u.get("start_date") for u in cue_units if u.get("start_date")]
+                        ends = [u.get("end_date") for u in cue_units if u.get("end_date")]
+                        total_spots_sum = 0
+                        try:
+                            total_spots_sum = int(sum([int(u.get("total_spots") or 0) for u in cue_units]))
+                        except Exception:
+                            total_spots_sum = 0
+                        parsed_rows.append({
+                            **job,
+                            "status": "ok",
+                            "ad_units": ad_units,
+                            "start_date_min": min(starts) if starts else "",
+                            "end_date_max": max(ends) if ends else "",
+                            "total_spots_sum": total_spots_sum,
+                            "error": "",
+                        })
+                        _log(f"[auto-parse] ok token={tok} ad_units={ad_units} total_spots_sum={total_spots_sum}")
+                    except Exception as e:
+                        _log(f"[auto-parse] parse failed token={tok} err={e}")
+                        parsed_rows.append({**job, "status": "parse_failed", "error": str(e), "ad_units": 0})
+                    prog.progress(int((idx + 1) / max(1, len(file_jobs)) * 100))
+
+                if parsed_rows:
+                    st.dataframe(pd.DataFrame(parsed_rows), use_container_width=True, hide_index=True)
+                else:
+                    st.info("沒有可解析的 Excel token（或尚未啟用自動解析）。")
         else:
             st.info("本次 listing 50 筆內沒有掃到任何 .xlsx/.xls token（可能 Excel 不在此欄位、或需單筆 API 才看得到）。")
 
