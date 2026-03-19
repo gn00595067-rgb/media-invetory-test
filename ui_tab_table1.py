@@ -132,7 +132,9 @@ def render_table1_tab(
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("訂單筆數", len(df_table1))
+        # 表1在 Segments 模式下會用 `ad_flight_segments` 建表，列數不等同 orders 筆數。
+        # 為避免混淆：上方「訂單筆數」一律以 orders 筆數為準。
+        st.metric("訂單筆數", len(df_orders))
     with col2:
         st.metric("客戶數", df_table1["客戶"].nunique() if "客戶" in df_table1.columns else (df_table1["HYUNDAI_CUSTIN"].nunique() if "HYUNDAI_CUSTIN" in df_table1.columns else 0))
     with col3:
@@ -145,6 +147,10 @@ def render_table1_tab(
     with col4:
         total_amount = df_table1["實收金額"].sum() if "實收金額" in df_table1.columns else 0
         st.metric("實收金額總計", f"{total_amount:,}")
+
+    if use_segments:
+        # 這段用來解釋「為什麼訂單筆數只有 178 / 為什麼你看到的列數和 orders 不一致」
+        st.caption(f"目前啟用 Segments 模式：表1顯示列數={len(df_table1)}（Segments 為彙總後的檔次段，不等同 orders 筆數）。")
 
     with st.expander("🔍 篩選條件", expanded=False):
         c1, c2, c3 = st.columns(3)
@@ -210,20 +216,18 @@ def render_table1_tab(
             mime="text/csv; charset=utf-8",
         )
 
-    if st.checkbox("顯示訂單逐筆管理（較慢）", value=False, key="table1_show_crud"):
-        render_order_crud_panel(
-            get_db_connection=get_db_connection,
-            load_platform_settings=load_platform_settings,
-            build_ad_flight_segments=build_ad_flight_segments,
-            compute_split_for_contract=compute_split_for_contract,
-            sync_sheets_if_enabled=sync_sheets_if_enabled,
-            styler_one_decimal=styler_one_decimal,
-            mock_platform_raw=mock_platform_raw,
-            mock_sales=mock_sales,
-            mock_company=mock_company,
-            mock_seconds=mock_seconds,
-            seconds_usage_types=seconds_usage_types,
-        )
-    else:
-        st.caption("尚未開啟訂單逐筆管理：可提升表1顯示速度。")
+    # 去掉 checkbox：避免「不勾什麼都不會出現」的體驗問題
+    render_order_crud_panel(
+        get_db_connection=get_db_connection,
+        load_platform_settings=load_platform_settings,
+        build_ad_flight_segments=build_ad_flight_segments,
+        compute_split_for_contract=compute_split_for_contract,
+        sync_sheets_if_enabled=sync_sheets_if_enabled,
+        styler_one_decimal=styler_one_decimal,
+        mock_platform_raw=mock_platform_raw,
+        mock_sales=mock_sales,
+        mock_company=mock_company,
+        mock_seconds=mock_seconds,
+        seconds_usage_types=seconds_usage_types,
+    )
 
