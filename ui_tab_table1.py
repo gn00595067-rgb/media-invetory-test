@@ -281,6 +281,10 @@ def render_table1_tab(
                         st.error("Google Sheet 同步失敗：" + "; ".join(errs[:5]))
                 if "_table1_cache_key" in st.session_state:
                     del st.session_state["_table1_cache_key"]
+                # 批次更新後重新組合 df_table1，可能導致先前平台篩選剛好匹配不到而 st.stop()，
+                # 讓使用者感覺「表1資料消失」。這裡保守地重置為「全部」確保不會被篩到空表。
+                st.session_state["table1_media_platform_filter"] = "全部"
+                st.session_state["table1_platform_filter"] = "全部"
                 # 更新後若仍維持「只顯示尚未填寫」，剛更新的 rows 會立刻被過濾掉，看起來像「全部消失」。
                 # 所以在成功更新後自動切換回顯示全部，讓你能立刻確認更新結果。
                 if only_missing:
