@@ -6117,15 +6117,18 @@ elif selected_tab == "🧪 Ragic抓取測試":
         return "ap13.ragic.com", "soundwow", "forms12", "17"
 
     def _ragic_listing_url(host: str, account: str, tab_folder: str, sheet_index: str, *, limit: int, offset: int, subtables0: bool, fts: str = ""):
-        # 參考 fptest：用 query string 直接組 `?api&v=3&...`，避免 params 影響 `api` 旗標
+        """
+        參考 fptest：用 query string 直接組 `?api&v=3&...`
+        注意：Ragic 的 api 旗標在部分環境下需要是 `?api`（無等號），不能用 `api=`。
+        """
         base = f"https://{host.strip().strip('/')}/{account.strip().strip('/')}/{tab_folder.strip().strip('/')}/{str(sheet_index).strip().strip('/')}"
-        qs = [("api", ""), ("v", "3"), ("limit", str(int(limit))), ("offset", str(int(offset)))]
+        from urllib.parse import quote
+        parts = [f"{base}?api", "v=3", f"limit={int(limit)}", f"offset={int(offset)}"]
         if subtables0:
-            qs.append(("subtables", "0"))
+            parts.append("subtables=0")
         if fts:
-            qs.append(("fts", fts))
-        from urllib.parse import urlencode
-        return base + "?" + urlencode(qs)
+            parts.append("fts=" + quote(fts))
+        return "&".join(parts)
 
     def _entry_to_row(e: dict):
         def g(name):
@@ -6169,6 +6172,11 @@ elif selected_tab == "🧪 Ragic抓取測試":
         if err:
             st.error(f"抓取失敗：{err}")
             st.stop()
+        # 診斷：顯示本次回傳的 key 數量（不暴露內容）
+        try:
+            st.caption(f"API 回傳 keys 數量：{len(payload) if isinstance(payload, dict) else '非 dict'}")
+        except Exception:
+            pass
         entries = _ragic_extract_entries(payload)
         if not entries:
             st.warning("沒有抓到任何資料（可能沒有權限或資料為空）。")
