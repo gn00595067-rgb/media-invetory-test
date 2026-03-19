@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Callable
 
+import json
 import pandas as pd
 import streamlit as st
 
@@ -29,6 +30,10 @@ def render_ragic_test_tab(
     # --- Debug log（可複製）---
     if "_ragic_debug_log" not in st.session_state:
         st.session_state["_ragic_debug_log"] = []
+    if "_ragic_last_listing_excel" not in st.session_state:
+        st.session_state["_ragic_last_listing_excel"] = []
+    if "_ragic_last_listing_meta" not in st.session_state:
+        st.session_state["_ragic_last_listing_meta"] = {}
 
     def _log(msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -77,6 +82,37 @@ def render_ragic_test_tab(
         date_to = st.date_input("日期迄", value=None)
 
     keyword = st.text_input("關鍵字（訂檔單號/客戶/產品/平台 任一包含）", value="")
+
+    def _deep_collect_excel_tokens(val: Any) -> list[str]:
+        """地毯式從 entry 中找出任何 .xlsx/.xls 的 ragic token（含巢狀 dict/list/子表）。"""
+        out: list[str] = []
+        if val is None:
+            return out
+        if isinstance(val, str):
+            s = val.strip()
+            if "@" in s and s.lower().endswith((".xlsx", ".xls")):
+                out.append(s)
+            return out
+        if isinstance(val, (list, tuple)):
+            for x in val:
+                out.extend(_deep_collect_excel_tokens(x))
+            return out
+        if isinstance(val, dict):
+            for x in val.values():
+                out.extend(_deep_collect_excel_tokens(x))
+            return out
+        return out
+
+    def _scan_entry_excel(entry: dict) -> list[str]:
+        tokens = _deep_collect_excel_tokens(entry)
+        # 去重但保序
+        seen = set()
+        uniq = []
+        for t in tokens:
+            if t not in seen:
+                seen.add(t)
+                uniq.append(t)
+        return uniq
 
     def _normalize_cell(v: Any) -> str:
         """將 Ragic 回傳的欄位值正規化成可顯示字串（list 轉以逗號串接）。"""
@@ -136,7 +172,7 @@ def render_ragic_test_tab(
 
     fetch_btn = st.button("🚀 抓取並顯示", type="primary")
     if fetch_btn:
-        st.session_state["_ragic_debug_log"] = []
+        _log("—" * 48)
         _log("開始抓取")
         if not api_key.strip():
             st.error("請輸入 Ragic API Key（可放 .streamlit/secrets.toml 的 RAGIC_API_KEY）。")
@@ -191,6 +227,38 @@ def render_ragic_test_tab(
 
         st.markdown("#### 🔎 解析後表格（前 5 列）")
         st.dataframe(df.head(5), use_container_width=True, hide_index=True)
+
+        # 先掃描本次 listing 內是否有任何 Excel token（避免卡在單筆）
+        listing_excel_rows = []
+        for e in entries:
+            toks = _scan_entry_excel(e)
+            if toks:
+                listing_excel_rows.append(
+                    {
+                        "_ragicId": e.get("_ragicId"),
+                        "訂檔單號": e.get("訂檔單號") or e.get(ragic_fields.get("訂檔單號", "")) or "",
+                        "excel_tokens_count": len(toks),
+                        "excel_tokens(head3)": toks[:3],
+                    }
+                )
+        st.session_state["_ragic_last_listing_excel"] = listing_excel_rows
+        st.session_state["_ragic_last_listing_meta"] = {
+            "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "limit": int(limit),
+            "offset": int(offset),
+            "entries": len(entries),
+            "entries_with_excel": len(listing_excel_rows),
+        }
+
+        st.markdown("#### ③ Excel 附件掃描（本次抓取的 listing 內）")
+        meta = st.session_state.get("_ragic_last_listing_meta", {})
+        st.caption(
+            f"抓取時間：{meta.get('fetched_at','')}；entries={meta.get('entries',0)}；含 Excel token 的 entries={meta.get('entries_with_excel',0)}"
+        )
+        if listing_excel_rows:
+            st.dataframe(pd.DataFrame(listing_excel_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("本次 listing 50 筆內沒有掃到任何 .xlsx/.xls token（可能 Excel 不在此欄位、或需單筆 API 才看得到）。")
 
         # 本機日期篩選
         if filter_field != "不篩" and (date_from or date_to):
@@ -272,6 +340,9 @@ def render_ragic_test_tab(
         cue_tokens = parse_file_tokens(cue_val)
         # 只解析 Excel；若只有 JPG/PDF，先提示
         excel_tokens = [t for t in cue_tokens if str(t).lower().endswith((".xlsx", ".xls"))]
+        if not excel_tokens:
+            # 單筆也做一次地毯式掃描，避免 Excel 放在其他欄位/子表
+            excel_tokens = _scan_entry_excel(entry)
         if not cue_tokens:
             st.info("此筆沒有「訂檔CUE表」檔案。")
         else:
@@ -347,4 +418,9 @@ def render_ragic_test_tab(
             mime="text/plain",
             key="download_ragic_log",
         )
+
+    # 額外：將「最後一次掃描到的 Excel token」提供複製（方便回報）
+    st.markdown("#### 📎 最後一次 Excel 掃描結果（可複製）")
+    excel_rows = st.session_state.get("_ragic_last_listing_excel", [])
+    st.text_area("excel_scan_json", value=json.dumps(excel_rows, ensure_ascii=False, indent=2), height=160, key="ragic_excel_scan_area")
 
