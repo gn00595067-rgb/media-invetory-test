@@ -5077,16 +5077,26 @@ with st.sidebar.expander("設定平台店數與營業時間"):
 # --- 主畫面：讀取資料（使用快取，切換年月/篩選時不重算）---
 _db_mtime = os.path.getmtime(DB_FILE) if os.path.exists(DB_FILE) else 0
 st.session_state['_db_mtime'] = _db_mtime  # 表3 fragment 重跑時用
-df_orders = _load_orders_cached(_db_mtime)
+_tab_hint = st.session_state.get("main_tab", "🧾 Ragic匯入紀錄")
 
-if df_orders.empty:
+# 分頁懶載入：只有需要 orders 的分頁才讀取（切到 Ragic 分頁可秒開）
+_tabs_need_orders = {
+    "📋 表1-資料",
+    "📅 表2-秒數明細",
+    "📉 總結表圖表",
+    "📊 分公司×媒體 每月秒數",
+    "📋 媒體秒數與採購",
+    "📊 ROI",
+    "🧪 實驗分頁",
+}
+df_orders = _load_orders_cached(_db_mtime) if _tab_hint in _tabs_need_orders else pd.DataFrame()
+if _tab_hint in _tabs_need_orders and df_orders.empty:
     st.warning("📭 資料庫為空，請由左側匯入試算表或新增訂單。")
 
 # 重新載入設定（確保最新）
 custom_settings = load_platform_settings()
 
 # 分頁懶載入：只有需要庫存/檔次資料的分頁才載入 segments/daily（降低切頁卡頓）
-_tab_hint = st.session_state.get("main_tab", "📋 表1-資料")
 _tabs_need_segments_daily = {
     "📋 表1-資料",
     "📅 表2-秒數明細",
@@ -5121,10 +5131,11 @@ TAB_OPTIONS_BY_ROLE = {
 role_label = {"行政主管": "🗂 行政主管", "業務": "🧑‍💼 業務", "總經理": "👔 總經理"}.get(role, role)
 st.markdown(f"#### 目前身份：{role_label}")
 tab_options_for_role = TAB_OPTIONS_BY_ROLE.get(role, TAB_OPTIONS)
-# 若目前選中的分頁不在該角色清單內，預設選第一個
-current_tab = st.session_state.get("main_tab", tab_options_for_role[0])
+# 首次進入預設輕量分頁（避免直接進表1造成初始等待過久）
+default_tab = "🧾 Ragic匯入紀錄" if "🧾 Ragic匯入紀錄" in tab_options_for_role else tab_options_for_role[0]
+current_tab = st.session_state.get("main_tab", default_tab)
 if current_tab not in tab_options_for_role:
-    st.session_state["main_tab"] = tab_options_for_role[0]
+    st.session_state["main_tab"] = default_tab
 
 
 @st.fragment
