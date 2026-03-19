@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 Ragic 抓取資料測試：搜尋單一案子 → 完整 Ragic 欄位展示 + CUE 解析成表1 + Excel/PDF 下載
+表1 呈現與主程式「📋 表1-資料」完整權限一致：同欄位順序、缺值顯示「無法判斷」/「抓不到」。
 """
 from __future__ import annotations
 
 import io
 import json
+import re
 from datetime import datetime
 from typing import Any, Callable
 
@@ -21,6 +23,48 @@ from ragic_client import (
     parse_file_tokens,
     parse_sheet_url,
 )
+
+
+# 與主程式 表1-資料 完整欄位順序一致（不含動態日期欄）
+TABLE1_BASE_COLUMNS = [
+    "業務", "主管", "合約編號", "公司", "實收金額", "除佣實收", "專案實收金額", "拆分金額",
+    "製作成本", "獎金%", "核定獎金", "加發獎金", "業務基金", "協力基金", "秒數用途", "提交日",
+    "HYUNDAI_CUSTIN", "秒數", "素材", "起始日", "終止日", "走期天數", "區域", "媒體平台",
+]
+TABLE1_HOUR_COLUMNS = [str(h) for h in [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 0, 1]]
+TABLE1_STAT_COLUMNS = ["每天總檔次", "委刊總檔數", "總秒數", "店數", "使用總秒數"]
+PLACEHOLDER_MISSING = "無法判斷"
+PLACEHOLDER_NOT_AVAILABLE = "抓不到"
+
+
+def _ensure_full_table1_columns(df: pd.DataFrame, placeholder: str = PLACEHOLDER_MISSING) -> pd.DataFrame:
+    """補齊表1 全部欄位，缺的欄位填 placeholder；日期欄（月/日(星期)）依 df 現有或補空。"""
+    if df.empty:
+        return df
+    # 動態日期欄：符合 1/1(四) 這種格式的欄位
+    date_cols = [c for c in df.columns if isinstance(c, str) and re.match(r"^\d{1,2}/\d{1,2}\([一二三四五六日]\)$", c)]
+    date_cols_sorted = sorted(date_cols, key=lambda x: (int(x.split("/")[0]), int(x.split("/")[1].split("(")[0])))
+    all_fixed = TABLE1_BASE_COLUMNS + TABLE1_HOUR_COLUMNS + TABLE1_STAT_COLUMNS + date_cols_sorted
+    for col in all_fixed:
+        if col not in df.columns:
+            df[col] = placeholder
+    # 其他 df 有但不在 list 的欄位放最後
+    other = [c for c in df.columns if c not in all_fixed]
+    order = [c for c in all_fixed if c in df.columns] + other
+    return df[[c for c in order if c in df.columns]]
+
+
+def _styler_one_decimal_ragic(df: pd.DataFrame):
+    """表1 數值欄位格式（與主程式 _styler_one_decimal 一致）。"""
+    if df is None or df.empty:
+        return df.style if hasattr(df, "style") else df
+    try:
+        num_cols = df.select_dtypes(include=["number"]).columns.tolist()
+        if not num_cols:
+            return df.style
+        return df.style.format({c: "{:,.1f}" for c in num_cols})
+    except Exception:
+        return df.style if hasattr(df, "style") else df
 
 
 def _normalize_cell(v: Any) -> str:
@@ -304,8 +348,8 @@ def render_ragic_test_tab(
         simple = [{"欄位": k, "值": _normalize_cell(v)} for k, v in entry.items()]
         st.dataframe(pd.DataFrame(simple), use_container_width=True, hide_index=True)
 
-    # 二、CUE Excel 解析成表1
-    st.markdown("##### 二、CUE Excel 解析為表1（最詳細列表）")
+    # 二、CUE Excel 解析成表1（與主程式 表1-資料 完整權限同欄位、缺值顯示無法判斷/抓不到）
+    st.markdown("##### 二、CUE Excel 解析為表1（與 📋 表1-資料 同欄位，缺值顯示「無法判斷」/「抓不到」）")
     cue_fid = ragic_fields.get("訂檔CUE表")
     cue_val = entry.get(cue_fid) if cue_fid and cue_fid in entry else entry.get("訂檔CUE表")
     cue_tokens = parse_file_tokens(cue_val)
@@ -335,33 +379,98 @@ def render_ragic_test_tab(
                 df_t1 = build_table1(cue_units, custom_settings=custom_settings)
                 if not df_t1.empty:
                     all_table1_dfs.append(df_t1)
-                    st.dataframe(df_t1, use_container_width=True, hide_index=True)
             else:
-                df_simple = pd.DataFrame([
-                    {
-                        "platform": u.get("platform"),
-                        "region": u.get("region"),
-                        "seconds": u.get("seconds"),
-                        "start_date": u.get("start_date"),
-                        "end_date": u.get("end_date"),
-                        "days": u.get("days"),
-                        "total_spots": u.get("total_spots"),
-                        "source_sheet": u.get("source_sheet"),
+                # 無 build_table1 時仍組出表1 結構，缺的欄位填「無法判斷」/「抓不到」
+                rows = []
+                for u in cue_units:
+                    daily_spots = u.get("daily_spots") or []
+                    total_spots = u.get("total_spots") or sum(daily_spots)
+                    sec = int(u.get("seconds") or 0)
+                    days = int(u.get("days") or len(daily_spots))
+                    row = {
+                        "業務": order_info.get("sales") or PLACEHOLDER_NOT_AVAILABLE,
+                        "主管": PLACEHOLDER_MISSING,
+                        "合約編號": order_info.get("order_id") or PLACEHOLDER_NOT_AVAILABLE,
+                        "公司": order_info.get("company") or PLACEHOLDER_NOT_AVAILABLE,
+                        "實收金額": PLACEHOLDER_MISSING,
+                        "除佣實收": PLACEHOLDER_MISSING,
+                        "專案實收金額": PLACEHOLDER_MISSING,
+                        "拆分金額": PLACEHOLDER_MISSING,
+                        "製作成本": PLACEHOLDER_MISSING,
+                        "獎金%": PLACEHOLDER_MISSING,
+                        "核定獎金": PLACEHOLDER_MISSING,
+                        "加發獎金": PLACEHOLDER_MISSING,
+                        "業務基金": PLACEHOLDER_MISSING,
+                        "協力基金": PLACEHOLDER_MISSING,
+                        "秒數用途": "銷售秒數",
+                        "提交日": PLACEHOLDER_MISSING,
+                        "HYUNDAI_CUSTIN": order_info.get("client") or PLACEHOLDER_NOT_AVAILABLE,
+                        "秒數": sec,
+                        "素材": order_info.get("product") or PLACEHOLDER_NOT_AVAILABLE,
+                        "起始日": u.get("start_date") or "",
+                        "終止日": u.get("end_date") or "",
+                        "走期天數": days,
+                        "區域": u.get("region") or "未知",
+                        "媒體平台": u.get("platform") or PLACEHOLDER_MISSING,
+                        "每天總檔次": daily_spots[0] if daily_spots else 0,
+                        "委刊總檔數": total_spots,
+                        "總秒數": total_spots * sec,
+                        "店數": PLACEHOLDER_MISSING,
+                        "使用總秒數": (total_spots * sec) if sec else 0,
                     }
-                    for u in cue_units
-                ])
-                st.dataframe(df_simple, use_container_width=True, hide_index=True)
+                    for h in TABLE1_HOUR_COLUMNS:
+                        row[h] = ""
+                    rows.append(row)
+                if rows:
+                    df_fallback = pd.DataFrame(rows)
+                    # 日期欄：從 cue_units 收集
+                    all_dates = set()
+                    for u in cue_units:
+                        for d in u.get("dates") or []:
+                            try:
+                                all_dates.add(pd.to_datetime(d))
+                            except Exception:
+                                pass
+                    if all_dates:
+                        weekday_map = {0: "一", 1: "二", 2: "三", 3: "四", 4: "五", 5: "六", 6: "日"}
+                        for d in sorted(all_dates):
+                            key = f"{d.month}/{d.day}({weekday_map[d.weekday()]})"
+                            if key not in df_fallback.columns:
+                                df_fallback[key] = ""
+                        for idx, u in enumerate(cue_units):
+                            dts = u.get("dates") or []
+                            dss = u.get("daily_spots") or []
+                            for j, (dt, sp) in enumerate(zip(dts, dss)):
+                                try:
+                                    dd = pd.to_datetime(dt)
+                                    key = f"{dd.month}/{dd.day}({weekday_map[dd.weekday()]})"
+                                    if key in df_fallback.columns and idx < len(df_fallback):
+                                        df_fallback.loc[df_fallback.index[idx], key] = sp
+                                except Exception:
+                                    pass
+                    all_table1_dfs.append(df_fallback)
 
-    # 合併表1（多檔時）
+    # 合併表1（多檔時）並補齊欄位、與主程式表1 同呈現
     if len(all_table1_dfs) > 1:
-        st.markdown("##### 表1 合併結果（所有 CUE 檔案）")
         df_combined = pd.concat(all_table1_dfs, ignore_index=True)
-        st.dataframe(df_combined, use_container_width=True, hide_index=True)
-        all_table1_dfs = [df_combined]
     elif len(all_table1_dfs) == 1:
-        df_combined = all_table1_dfs[0]
+        df_combined = all_table1_dfs[0].copy()
     else:
         df_combined = pd.DataFrame()
+
+    if not df_combined.empty:
+        df_combined = _ensure_full_table1_columns(df_combined, placeholder=PLACEHOLDER_MISSING)
+        # 與 表1-資料 最大權限相同：可橫向滾動、完整欄位
+        st.markdown("#### 📊 表1-資料（可橫向滾動查看完整欄位）")
+        st.dataframe(
+            _styler_one_decimal_ragic(df_combined),
+            use_container_width=True,
+            height=650,
+        )
+        st.info(
+            "💡 **提示**：此表格與主程式「📋 表1-資料」完整權限相同欄位。"
+            " 抓不到或無法判斷的資料已顯示為「無法判斷」或「抓不到」。請使用橫向滾動查看完整內容。"
+        )
 
     # 下載 Excel
     st.markdown("##### 📥 下載")
