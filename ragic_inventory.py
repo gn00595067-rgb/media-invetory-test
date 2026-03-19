@@ -6087,6 +6087,10 @@ elif selected_tab == "🧪 Ragic抓取測試":
         if len(st.session_state["_ragic_debug_log"]) > 500:
             st.session_state["_ragic_debug_log"] = st.session_state["_ragic_debug_log"][-500:]
 
+    # 讓使用者在未操作時也看得到 log 區塊有作用
+    if not st.session_state["_ragic_debug_log"]:
+        _log("頁面載入：尚未開始抓取（按「🚀 抓取並顯示」後會產生詳細 log）")
+
     # 從「訂檔網址」推導 host/account/tab/sheet
     default_ragic_url = "https://ap13.ragic.com/soundwow/forms12/17"
     ragic_url = st.text_input("訂檔表單（Listing/Sheet）網址", value=default_ragic_url, help="格式類似：https://ap13.ragic.com/soundwow/forms12/17")
@@ -6202,6 +6206,16 @@ elif selected_tab == "🧪 Ragic抓取測試":
                 _log(f"取樣 payload 失敗：{e}")
         entries = _ragic_extract_entries(payload)
         _log(f"entries count={len(entries)}")
+        try:
+            if entries:
+                e0 = entries[0]
+                if isinstance(e0, dict):
+                    _log("第一筆 entry keys(head 20)=" + ",".join(list(e0.keys())[:20]))
+                    _log(f"第一筆 _ragicId={e0.get('_ragicId')}")
+                else:
+                    _log(f"第一筆 entry type={type(e0).__name__}")
+        except Exception as e:
+            _log(f"第一筆 entry 診斷失敗：{e}")
         if not entries:
             st.warning("沒有抓到任何資料（可能沒有權限或資料為空）。")
             _log("entries 為空，停止")
@@ -6315,7 +6329,9 @@ elif selected_tab == "🧪 Ragic抓取測試":
     st.markdown("---")
     st.markdown("#### 🧾 Debug Log（可直接複製貼回）")
     log_text = "\n".join(st.session_state.get("_ragic_debug_log", []))
-    st.text_area("log", value=log_text, height=220, key="ragic_debug_log_area")
+    # text_area 有 widget state，先同步 value 到 session_state 以確保每次 rerun 都更新顯示
+    st.session_state["ragic_debug_log_area"] = log_text
+    st.text_area("log", value=st.session_state.get("ragic_debug_log_area", ""), height=220, key="ragic_debug_log_area")
     b1, b2 = st.columns([1, 3])
     with b1:
         if st.button("清除 log", key="btn_clear_ragic_log"):
