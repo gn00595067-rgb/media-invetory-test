@@ -255,8 +255,6 @@ def render_table1_tab(
                     "total_store_seconds",
                     "updated_at",
                 ]
-                show_cols = [c for c in desired_cols if c in show_df.columns]
-
                 grid_df_full = show_df.copy()
                 visible_ids = grid_df_full["segment_id"].astype(str).tolist() if "segment_id" in grid_df_full.columns else []
 
@@ -275,6 +273,7 @@ def render_table1_tab(
                     st.caption(f"目前已選取：{len(selected_set)} 筆（跨篩選條件保留）")
 
                 show_df["選取"] = show_df["segment_id"].astype(str).isin(selected_set) if "segment_id" in show_df.columns else False
+                show_cols = [c for c in desired_cols if c in show_df.columns]
                 grid_df = show_df[show_cols].copy()
                 # 穩定模式：直接使用 data_editor，避免部分環境 AgGrid 會出現「有筆數但畫面空白」。
                 edited_df = st.data_editor(
