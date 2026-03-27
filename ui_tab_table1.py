@@ -233,15 +233,10 @@ def render_table1_tab(
                     st.session_state["seg_selected_ids"] = []
                 selected_set = set(str(x) for x in st.session_state.get("seg_selected_ids", []))
 
-                show_df["segment_id_short"] = show_df["segment_id"].astype(str).str[:8]
-
                 # 顯示欄位：盡量對齊表1常用對帳欄（Segments 本身沒有小時/每日欄位，所以用 segments 可用的詳細度）
                 desired_cols = [
                     "選取",
-                    "segment_id_short",
-                    "segment_id",
                     "合約編號",
-                    "source_order_id",
                     "seconds_type",
                     "company",
                     "sales",
@@ -262,8 +257,8 @@ def render_table1_tab(
                 ]
                 show_cols = [c for c in desired_cols if c in show_df.columns]
 
-                grid_df = show_df[show_cols].copy()
-                visible_ids = grid_df["segment_id"].astype(str).tolist() if "segment_id" in grid_df.columns else []
+                grid_df_full = show_df.copy()
+                visible_ids = grid_df_full["segment_id"].astype(str).tolist() if "segment_id" in grid_df_full.columns else []
 
                 ctrl1, ctrl2, ctrl3 = st.columns([1, 1, 2])
                 with ctrl1:
@@ -279,7 +274,8 @@ def render_table1_tab(
                 with ctrl3:
                     st.caption(f"目前已選取：{len(selected_set)} 筆（跨篩選條件保留）")
 
-                grid_df["選取"] = grid_df["segment_id"].astype(str).isin(selected_set) if "segment_id" in grid_df.columns else False
+                show_df["選取"] = show_df["segment_id"].astype(str).isin(selected_set) if "segment_id" in show_df.columns else False
+                grid_df = show_df[show_cols].copy()
                 # 穩定模式：直接使用 data_editor，避免部分環境 AgGrid 會出現「有筆數但畫面空白」。
                 edited_df = st.data_editor(
                     grid_df,
@@ -289,8 +285,9 @@ def render_table1_tab(
                     height=360,
                     key="seg_multi_edit_table",
                 )
-                if "segment_id" in edited_df.columns and "選取" in edited_df.columns:
-                    selected_now = edited_df.loc[edited_df["選取"] == True, "segment_id"].astype(str).tolist()
+                if "選取" in edited_df.columns and visible_ids:
+                    selected_row_idx = edited_df.index[edited_df["選取"] == True].tolist()
+                    selected_now = [visible_ids[i] for i in selected_row_idx if 0 <= int(i) < len(visible_ids)]
                     selected_set.difference_update(visible_ids)
                     selected_set.update(selected_now)
                     st.session_state["seg_selected_ids"] = sorted(selected_set)
