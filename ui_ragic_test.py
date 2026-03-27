@@ -520,9 +520,18 @@ def render_ragic_test_tab(
 
     default_url = "https://ap13.ragic.com/soundwow/forms12/17"
     ragic_url = st.text_input("訂檔表單網址", value=default_url, help="Ragic 表單 URL")
-    api_key = ""
+    # 方便測試：若 secrets 沒配置，先帶入暫時預設 key（之後可再移除）
+    api_key = "MEwyTEExWHJQamRDalZ6N0hzQ2syZlBHNUNJeWhwZFBrM3BMM2tDRWd4aGIvZ1JxWTlYaGkyM0RoRmo1ZExHaA=="
     try:
-        api_key = (st.secrets.get("RAGIC_API_KEY") or "").strip()
+        # 相容兩種 secrets 寫法：
+        # 1) RAGIC_API_KEY = "..."
+        # 2) [ragic] api_key = "..."
+        api_key = (
+            st.secrets.get("RAGIC_API_KEY")
+            or st.secrets.get("ragic", {}).get("api_key")
+            or st.secrets.get("RAGIC", {}).get("api_key")
+            or api_key
+        ).strip()
     except Exception:
         pass
     api_key_input = st.text_input("Ragic API Key", value=api_key, type="password", help="可放在 .streamlit/secrets.toml 的 RAGIC_API_KEY")
