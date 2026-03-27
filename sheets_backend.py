@@ -390,6 +390,84 @@ def write_segments_to_sheets(df: pd.DataFrame) -> str | None:
         return str(e)
 
 
+def _col_to_a1(col_idx_1based: int) -> str:
+    """1-based column index -> A1 column label."""
+    n = int(col_idx_1based)
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def update_segments_seconds_type_rows(
+    updates: list[tuple[str, str, str]] | list[tuple[str, str]],
+) -> list[str]:
+    """
+    精準更新 Segments 工作表中指定 segment_id 的 seconds_type（與 updated_at）。
+    updates:
+      - (segment_id, seconds_type)
+      - (segment_id, seconds_type, updated_at)
+    回傳錯誤列表；空表示成功。
+    """
+    errors: list[str] = []
+    if not updates:
+        return errors
+    try:
+        sh = _client()
+        if not sh:
+            return ["未設定或未啟用 Google Sheet"]
+        _ensure_worksheets(sh)
+        ws = sh.worksheet(WS_SEGMENTS)
+        values = ws.get_all_values() or []
+        if not values:
+            return ["Segments 工作表為空，無法逐列更新"]
+        header = [str(h).strip() for h in values[0]]
+        if "segment_id" not in header or "seconds_type" not in header:
+            return ["Segments 工作表缺少必要欄位（segment_id / seconds_type）"]
+
+        col_seg = header.index("segment_id") + 1
+        col_stype = header.index("seconds_type") + 1
+        col_updated = (header.index("updated_at") + 1) if "updated_at" in header else None
+
+        row_by_seg: dict[str, int] = {}
+        for ridx, row in enumerate(values[1:], start=2):
+            seg_val = str(row[col_seg - 1]).strip() if len(row) >= col_seg else ""
+            if seg_val and seg_val not in row_by_seg:
+                row_by_seg[seg_val] = ridx
+
+        payload = []
+        missing_ids = []
+        for item in updates:
+            if len(item) == 2:
+                seg_id, new_stype = item  # type: ignore[misc]
+                upd_ts = ""
+            else:
+                seg_id, new_stype, upd_ts = item  # type: ignore[misc]
+            seg_id_s = str(seg_id).strip()
+            if not seg_id_s:
+                continue
+            row_idx = row_by_seg.get(seg_id_s)
+            if row_idx is None:
+                missing_ids.append(seg_id_s)
+                continue
+            stype_a1 = f"{_col_to_a1(col_stype)}{row_idx}"
+            payload.append({"range": stype_a1, "values": [[str(new_stype or "")]]})
+            if col_updated and str(upd_ts or "").strip():
+                upd_a1 = f"{_col_to_a1(col_updated)}{row_idx}"
+                payload.append({"range": upd_a1, "values": [[str(upd_ts)]]})
+
+        if missing_ids:
+            errors.append(f"Segments 找不到 {len(missing_ids)} 筆 segment_id（前5筆）：{', '.join(missing_ids[:5])}")
+        if payload:
+            ws.batch_update(payload, value_input_option="USER_ENTERED")
+        elif not errors:
+            errors.append("沒有可更新的 segment_id")
+    except Exception as e:
+        errors.append(str(e))
+    return errors
+
+
 def write_platform_settings_to_sheets(df: pd.DataFrame) -> str | None:
     try:
         sh = _client()

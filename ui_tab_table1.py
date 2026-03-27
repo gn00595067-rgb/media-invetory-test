@@ -329,9 +329,29 @@ def render_table1_tab(
                     conn_upd.close()
 
                     if auto_sync:
-                        errs = sync_sheets_if_enabled(only_tables=["Segments"], skip_if_unchanged=False)
+                        # 先做「逐列精準同步」；若失敗再 fallback 全表同步，提升正確性與可追蹤性。
+                        sync_msgs = []
+                        errs = []
+                        try:
+                            from sheets_backend import update_segments_seconds_type_rows
+
+                            row_updates = [(seg_id, new_seconds_type, now_ts) for seg_id in seg_id_selected_list]
+                            row_errs = update_segments_seconds_type_rows(row_updates)
+                            if row_errs:
+                                sync_msgs.append("逐列同步失敗，改用全表同步。")
+                                errs = sync_sheets_if_enabled(only_tables=["Segments"], skip_if_unchanged=False)
+                                errs = row_errs + (errs or [])
+                            else:
+                                sync_msgs.append(f"逐列同步成功：{len(seg_id_selected_list)} 筆。")
+                        except Exception as e:
+                            sync_msgs.append("逐列同步例外，改用全表同步。")
+                            errs = [f"row_sync_exception: {e}"] + (sync_sheets_if_enabled(only_tables=["Segments"], skip_if_unchanged=False) or [])
+
                         if errs:
                             st.error("Google Sheet 同步失敗：" + "; ".join(errs[:5]))
+                        else:
+                            for m in sync_msgs:
+                                st.caption(f"✅ {m}")
                     if "_table1_cache_key" in st.session_state:
                         del st.session_state["_table1_cache_key"]
                     # 下一輪 rerun 前先設定旗標；在 checkbox 建立之前切回 False。
