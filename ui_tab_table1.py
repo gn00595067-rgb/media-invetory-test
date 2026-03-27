@@ -275,33 +275,41 @@ def render_table1_tab(
                 show_df["選取"] = show_df["segment_id"].astype(str).isin(selected_set) if "segment_id" in show_df.columns else False
                 show_cols = [c for c in desired_cols if c in show_df.columns]
                 grid_df = show_df[show_cols].copy()
-                # 穩定模式：直接使用 data_editor，避免部分環境 AgGrid 會出現「有筆數但畫面空白」。
-                edited_df = st.data_editor(
-                    grid_df,
-                    column_config={"選取": st.column_config.CheckboxColumn("選取")},
-                    disabled=[c for c in show_cols if c != "選取"],
-                    hide_index=True,
-                    height=360,
-                    key="seg_multi_edit_table",
-                )
-                if "選取" in edited_df.columns and visible_ids:
-                    selected_row_idx = edited_df.index[edited_df["選取"] == True].tolist()
-                    selected_now = [visible_ids[i] for i in selected_row_idx if 0 <= int(i) < len(visible_ids)]
-                    selected_set.difference_update(visible_ids)
-                    selected_set.update(selected_now)
-                    st.session_state["seg_selected_ids"] = sorted(selected_set)
+                # 以 segment_id 當內部索引，避免排序/重繪後用列號對應造成勾選跳掉。
+                if "segment_id" in show_df.columns:
+                    grid_df.index = show_df["segment_id"].astype(str)
 
-                new_seconds_type = st.selectbox(
-                    "新的秒數用途(seconds_type)",
-                    options=list(seconds_usage_types),
-                    index=0,
-                    key="seg_multi_edit_new_seconds_type",
-                )
+                # 表單模式：勾選不即時重跑整頁，只有按提交才套用，體感更順。
+                with st.form("seg_multi_edit_form", clear_on_submit=False):
+                    edited_df = st.data_editor(
+                        grid_df,
+                        column_config={"選取": st.column_config.CheckboxColumn("選取")},
+                        disabled=[c for c in show_cols if c != "選取"],
+                        hide_index=True,
+                        height=360,
+                        key="seg_multi_edit_table",
+                    )
 
-                auto_sync = st.checkbox("套用後立即同步 Google Sheet", value=True, key="seg_multi_edit_auto_sync")
-                seg_id_selected_list = sorted(set(str(x) for x in st.session_state.get("seg_selected_ids", [])))
+                    new_seconds_type = st.selectbox(
+                        "新的秒數用途(seconds_type)",
+                        options=list(seconds_usage_types),
+                        index=0,
+                        key="seg_multi_edit_new_seconds_type",
+                    )
 
-                if st.button("批次套用並同步", type="primary", disabled=len(seg_id_selected_list) == 0, key="seg_multi_edit_apply_sync"):
+                    auto_sync = st.checkbox("套用後立即同步 Google Sheet", value=True, key="seg_multi_edit_auto_sync")
+                    apply_clicked = st.form_submit_button("批次套用並同步", type="primary")
+
+                seg_id_selected_list = []
+                if "選取" in edited_df.columns:
+                    seg_id_selected_list = edited_df.index[edited_df["選取"] == True].astype(str).tolist()
+                st.session_state["seg_selected_ids"] = sorted(set(seg_id_selected_list))
+                st.caption(f"本次選取：{len(seg_id_selected_list)} 筆")
+
+                if apply_clicked:
+                    if len(seg_id_selected_list) == 0:
+                        st.warning("請先勾選至少 1 筆資料。")
+                        st.stop()
                     now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     selected_rows_df = seg_source_df[seg_source_df["segment_id"].astype(str).isin(seg_id_selected_list)].copy() if "segment_id" in seg_source_df.columns else pd.DataFrame()
                     conn_upd = get_db_connection()
