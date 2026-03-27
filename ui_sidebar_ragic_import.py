@@ -34,6 +34,9 @@ def render_sidebar_ragic_import(
             )
         except Exception:
             pass
+        # Streamlit widget key 一旦存在，value 不會覆蓋；這裡在空值時主動補預設。
+        if not str(st.session_state.get("ragic_import_api_key", "")).strip():
+            st.session_state["ragic_import_api_key"] = str(api_default).strip()
         ragic_import_api_key = st.text_input("Ragic API Key", value=api_default, type="password", key="ragic_import_api_key")
         ragic_date_field = st.selectbox(
             "日期欄位",
