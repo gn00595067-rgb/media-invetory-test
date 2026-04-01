@@ -486,12 +486,14 @@ def _ragic_entry_collect_order_rows(
             continue
         cue_parse_diag: list[str] = []
         cue_layout_sec: list[str] = []
+        cue_struct_sec: list[str] = []
         try:
             cue_units = parse_cue_excel_for_table1(
                 content,
                 order_info=order_info,
                 cue_parse_diagnostics=cue_parse_diag,
                 cue_layout_sections=cue_layout_sec,
+                cue_structural_reports=cue_struct_sec,
             )
         except Exception as e:
             cue_units = []
