@@ -11,7 +11,6 @@ def render_sidebar_account(
     user: dict,
     role: str,
     roles: list[str],
-    sync_sheets_if_enabled,
     auth_verify,
     auth_change_password,
     auth_list_users,
@@ -20,42 +19,7 @@ def render_sidebar_account(
 ) -> None:
     st.sidebar.title("⚙️ 控制台")
     st.sidebar.caption(f"👤 {user['username']}（{role}）")
-
-    try:
-        from sheets_backend import is_sheets_enabled, get_sheets_status, get_sheets_url
-
-        sheets_on = is_sheets_enabled()
-        sheets_status, sheets_reason = get_sheets_status()
-        sheets_url = get_sheets_url()
-    except Exception:
-        sheets_on = False
-        sheets_status, sheets_reason = "disabled", "無法載入設定"
-        sheets_url = None
-    if sheets_on:
-        load_errs = st.session_state.get("_sheets_load_errors")
-        if load_errs:
-            st.sidebar.warning("📄 啟動時自 Google Sheet 還原有誤（前幾筆）：" + "; ".join(load_errs[:2]))
-        else:
-            st.sidebar.caption("📄 資料已同步至 Google Sheet")
-        if st.sidebar.button("🔄 立即同步至 Google Sheet", key="btn_sheets_sync"):
-            errs = sync_sheets_if_enabled()
-            if errs:
-                st.session_state["_sheets_last_sync"] = ("error", "同步失敗: " + "; ".join(errs[:3]))
-            else:
-                st.session_state["_sheets_last_sync"] = ("success", "已同步至 Google Sheet")
-        sync_status = st.session_state.get("_sheets_last_sync")
-        if sync_status:
-            kind, msg = sync_status
-            if kind == "error":
-                st.sidebar.error(msg)
-            else:
-                st.sidebar.success(msg)
-        if role in ("行政主管", "總經理") and sheets_url:
-            st.sidebar.link_button("🔗 開啟資料庫 Google Sheet", sheets_url, use_container_width=True)
-    else:
-        st.sidebar.caption("📄 未設定 Google Sheet（可於 .streamlit/secrets.toml 或 Cloud Secrets 設定）")
-        if sheets_reason:
-            st.sidebar.caption(f"原因：{sheets_reason}")
+    st.sidebar.caption("📄 Google Sheet DB 同步功能已停用（僅保留 Ragic 流程）")
 
     if st.sidebar.button("🚪 登出", key="btn_logout"):
         del st.session_state["user"]

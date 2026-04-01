@@ -154,21 +154,8 @@ def init_db():
 
 
 def _sync_sheets_if_enabled(only_tables=None, skip_if_unchanged=True):
-    """若已設定 Google Sheet 後端，將目前 DB 同步至試算表。回傳錯誤列表（空表示成功）。"""
-    try:
-        from sheets_backend import is_sheets_enabled, sync_db_to_sheets
-        if is_sheets_enabled():
-            return sync_db_to_sheets(
-                get_db_connection,
-                only_tables=only_tables,
-                skip_if_unchanged=skip_if_unchanged,
-            )
-    except Exception:
-        # 這裡不能默默吞掉錯誤：不然 UI 會誤判「已同步但其實沒有」
-        # 讓使用者看到可用的錯誤訊息以便排除權限/保護問題。
-        import traceback
-
-        return ["sync_sheets_if_enabled exception: " + traceback.format_exc(limit=2).strip()]
+    """Google Sheet DB 功能已停用；保留介面相容性。"""
+    _ = (only_tables, skip_if_unchanged)
     return []
 
 
@@ -570,26 +557,8 @@ def _normalize_date(val):
 
 
 def import_google_sheet_to_orders(url_or_id, replace_existing=True, merge_orders_by_contract_id: bool = False):
-    """
-    從 Google 試算表（表1結構）匯入至 orders，並建立 ad_flight_segments。
-    url_or_id: 試算表完整網址或 Sheet ID。
-    replace_existing: True 則先清空 orders 再匯入；False 則追加。
-    回傳 (success: bool, message: str)
-    """
-    from services_google_import import import_google_sheet_to_orders_service
-
-    return import_google_sheet_to_orders_service(
-        url_or_id=url_or_id,
-        replace_existing=replace_existing,
-        merge_orders_by_contract_id=merge_orders_by_contract_id,
-        normalize_seconds_type=_normalize_seconds_type,
-        init_db=init_db,
-        get_db_connection=get_db_connection,
-        load_platform_settings=load_platform_settings,
-        build_ad_flight_segments=build_ad_flight_segments,
-        compute_and_save_split_amount_for_contract=_compute_and_save_split_amount_for_contract,
-        sync_sheets_if_enabled=_sync_sheets_if_enabled,
-    )
+    _ = (url_or_id, replace_existing, merge_orders_by_contract_id)
+    return False, "Google Sheet 匯入功能已停用（目前僅保留 Ragic 流程）"
 
 
 def build_ad_flight_segments(df_orders, custom_settings=None, write_to_db=True, sync_sheets=True):
@@ -864,7 +833,6 @@ run_app_shell(
     auth_create_user=auth_create_user,
     auth_delete_user=auth_delete_user,
     sync_sheets_if_enabled=_sync_sheets_if_enabled,
-    import_google_sheet_to_orders=import_google_sheet_to_orders,
     import_ragic_to_orders_by_date_range=import_ragic_to_orders_by_date_range,
     import_ragic_single_entry_to_orders=import_ragic_single_entry_to_orders,
     load_platform_settings=load_platform_settings,

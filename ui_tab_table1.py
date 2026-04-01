@@ -297,8 +297,7 @@ def render_table1_tab(
                         key="seg_multi_edit_new_seconds_type",
                     )
 
-                    auto_sync = st.checkbox("套用後立即同步 Google Sheet（Segments 工作表）", value=True, key="seg_multi_edit_auto_sync")
-                    sync_source_sheet = st.checkbox("同步回寫來源匯入表（高風險，可能因匹配條件影響多列）", value=False, key="seg_multi_edit_sync_source_sheet")
+                    st.caption("Google Sheet 同步/回寫功能已停用（目前僅保留 Ragic 流程）")
                     apply_clicked = st.form_submit_button("批次套用並同步", type="primary")
 
                 seg_id_selected_list = []
@@ -389,66 +388,6 @@ def render_table1_tab(
                     except Exception as e:
                         st.caption(f"ℹ️ Ragic 秒數管理備註回寫略過：{e}")
 
-                    if auto_sync:
-                        # 先做「逐列精準同步」；若失敗再 fallback 全表同步，提升正確性與可追蹤性。
-                        sync_msgs = []
-                        errs = []
-                        try:
-                            from sheets_backend import update_segments_seconds_type_rows
-
-                            row_updates = [(seg_id, new_seconds_type, now_ts) for seg_id in seg_id_selected_list]
-                            row_errs = update_segments_seconds_type_rows(row_updates)
-                            if row_errs:
-                                sync_msgs.append("逐列同步失敗，改用全表同步。")
-                                errs = sync_sheets_if_enabled(only_tables=["Segments"], skip_if_unchanged=False)
-                                errs = row_errs + (errs or [])
-                            else:
-                                sync_msgs.append(f"逐列同步成功：{len(seg_id_selected_list)} 筆。")
-                        except Exception as e:
-                            sync_msgs.append("逐列同步例外，改用全表同步。")
-                            errs = [f"row_sync_exception: {e}"] + (sync_sheets_if_enabled(only_tables=["Segments"], skip_if_unchanged=False) or [])
-
-                        if errs:
-                            st.error("Google Sheet 同步失敗：" + "; ".join(errs[:5]))
-                        else:
-                            for m in sync_msgs:
-                                st.caption(f"✅ {m}")
-
-                        # 可選：回寫來源匯入表（高風險，預設關閉）
-                        if sync_source_sheet:
-                            try:
-                                src_url = (st.session_state.get("gs_import_url") or "").strip()
-                                if src_url and not selected_rows_df.empty:
-                                    from services_google_import import extract_google_sheet_id
-                                    from sheets_backend import update_source_sheet_seconds_type
-
-                                    src_sheet_id = extract_google_sheet_id(src_url) or ""
-                                    if src_sheet_id:
-                                        src_updates = []
-                                        for _, r in selected_rows_df.iterrows():
-                                            src_updates.append(
-                                                {
-                                                    "platform": r.get("platform", ""),
-                                                    "company": r.get("company", ""),
-                                                    "sales": r.get("sales", ""),
-                                                    "client": r.get("client", ""),
-                                                    "product": r.get("product", ""),
-                                                    "start_date": r.get("start_date", ""),
-                                                    "end_date": r.get("end_date", ""),
-                                                    "seconds": r.get("seconds", 0),
-                                                    "spots": r.get("spots", 0),
-                                                    "region": r.get("region", ""),
-                                                    "contract_id": r.get("contract_id", ""),
-                                                    "seconds_type": new_seconds_type,
-                                                }
-                                            )
-                                        src_errs = update_source_sheet_seconds_type(source_sheet_id=src_sheet_id, updates=src_updates)
-                                        if src_errs:
-                                            st.warning("來源匯入表回寫提示：" + "; ".join(src_errs[:3]))
-                                        else:
-                                            st.caption("✅ 已回寫匯入來源表的秒數用途。")
-                            except Exception as e:
-                                st.warning(f"來源匯入表回寫例外：{e}")
                     if "_table1_cache_key" in st.session_state:
                         del st.session_state["_table1_cache_key"]
                     # 下一輪 rerun 前先設定旗標；在 checkbox 建立之前切回 False。

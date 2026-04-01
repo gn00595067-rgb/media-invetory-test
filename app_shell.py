@@ -20,7 +20,6 @@ def run_app_shell(
     auth_create_user,
     auth_delete_user,
     sync_sheets_if_enabled,
-    import_google_sheet_to_orders,
     import_ragic_to_orders_by_date_range,
     import_ragic_single_entry_to_orders,
     load_platform_settings,
@@ -71,21 +70,6 @@ def run_app_shell(
 ) -> None:
     init_db()
 
-    if "_sheets_restored" not in st.session_state:
-        try:
-            from sheets_backend import is_sheets_enabled, load_all_from_sheets_into_db
-
-            if is_sheets_enabled():
-                load_errors = load_all_from_sheets_into_db(get_db_connection, init_db)
-                st.session_state["_sheets_restored"] = True
-                st.session_state["_sheets_load_errors"] = load_errors if load_errors else None
-            else:
-                st.session_state["_sheets_restored"] = True
-                st.session_state["_sheets_load_errors"] = None
-        except Exception as e:
-            st.session_state["_sheets_restored"] = True
-            st.session_state["_sheets_load_errors"] = [str(e)]
-
     if "user" not in st.session_state or st.session_state.get("user") is None:
         st.markdown("### 🔐 登入")
         st.caption("請輸入帳號與密碼。（測試用：已預填行政主管 admin / admin123）")
@@ -106,7 +90,6 @@ def run_app_shell(
     role = user["role"]
 
     from ui_sidebar_account import render_sidebar_account
-    from ui_sidebar_google_import import render_sidebar_google_import
     from ui_sidebar_ragic_import import render_sidebar_ragic_import
     from ui_sidebar_admin import render_sidebar_admin
     from app_runtime_data import load_runtime_data
@@ -115,14 +98,12 @@ def run_app_shell(
         user=user,
         role=role,
         roles=roles,
-        sync_sheets_if_enabled=sync_sheets_if_enabled,
         auth_verify=auth_verify,
         auth_change_password=auth_change_password,
         auth_list_users=auth_list_users,
         auth_create_user=auth_create_user,
         auth_delete_user=auth_delete_user,
     )
-    render_sidebar_google_import(import_google_sheet_to_orders=import_google_sheet_to_orders)
     render_sidebar_ragic_import(import_ragic_to_orders_by_date_range=import_ragic_to_orders_by_date_range)
     render_sidebar_admin(
         get_db_connection=get_db_connection,
