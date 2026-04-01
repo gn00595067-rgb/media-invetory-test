@@ -41,6 +41,8 @@ def render_table1_tab(
 ) -> None:
     st.markdown("### 📋 表1－資料（訂單主表）")
     st.caption("此表對應 Excel：秒數管理表 → 表1-資料，為行政與業務對帳用之訂單主表。")
+    if "_ragic_upload_feedback" not in st.session_state:
+        st.session_state["_ragic_upload_feedback"] = None
 
     # 商業定義：表1本來就是要以 Segments（排程/檔次段）為主體口徑。
     # 為避免 UI 語意錯置，移除切換勾選框，直接永遠使用 Segments。
@@ -311,6 +313,20 @@ def render_table1_tab(
                     seg_id_selected_list = edited_df.index[sel_mask].astype(str).tolist()
                 st.session_state["seg_selected_ids"] = sorted(set(seg_id_selected_list))
                 st.caption(f"本次選取：{len(seg_id_selected_list)} 筆")
+                feedback = st.session_state.get("_ragic_upload_feedback")
+                if isinstance(feedback, dict) and feedback.get("lines"):
+                    level = str(feedback.get("level", "info"))
+                    msg = str(feedback.get("message", "Ragic 回寫結果"))
+                    if level == "success":
+                        st.success(msg)
+                    elif level == "warning":
+                        st.warning(msg)
+                    elif level == "error":
+                        st.error(msg)
+                    else:
+                        st.info(msg)
+                    with st.expander("查看 Ragic 上傳結果明細", expanded=True):
+                        st.code("\n".join([str(x) for x in feedback.get("lines", [])]), language="text")
 
                 if apply_clicked:
                     if len(seg_id_selected_list) == 0:
@@ -394,18 +410,36 @@ def render_table1_tab(
                             ragic_report_lines.extend([str(x) for x in ragic_msgs])
                             failed_msgs = [m for m in ragic_msgs if ("失敗" in str(m) or "找不到" in str(m))]
                             if touched > 0 and not failed_msgs:
-                                st.success(f"Ragic 秒數用途回寫成功：{touched} 筆")
+                                st.session_state["_ragic_upload_feedback"] = {
+                                    "level": "success",
+                                    "message": f"Ragic 秒數用途回寫成功：{touched} 筆",
+                                    "lines": ragic_report_lines,
+                                }
                             elif touched > 0:
-                                st.warning(f"Ragic 秒數用途回寫部分成功：成功 {touched}，異常 {len(failed_msgs)}")
+                                st.session_state["_ragic_upload_feedback"] = {
+                                    "level": "warning",
+                                    "message": f"Ragic 秒數用途回寫部分成功：成功 {touched}，異常 {len(failed_msgs)}",
+                                    "lines": ragic_report_lines,
+                                }
                             else:
-                                st.error("Ragic 秒數用途回寫未成功。")
+                                st.session_state["_ragic_upload_feedback"] = {
+                                    "level": "error",
+                                    "message": "Ragic 秒數用途回寫未成功。",
+                                    "lines": ragic_report_lines,
+                                }
                         else:
-                            st.warning("此次沒有可回寫到 Ragic 的合約（因此不會發送 API 更新）。")
                             ragic_report_lines.append("未送出 API 更新：可回寫合約數為 0。")
-                        with st.expander("查看 Ragic 上傳結果明細", expanded=True):
-                            st.code("\n".join(ragic_report_lines), language="text")
+                            st.session_state["_ragic_upload_feedback"] = {
+                                "level": "warning",
+                                "message": "此次沒有可回寫到 Ragic 的合約（因此不會發送 API 更新）。",
+                                "lines": ragic_report_lines,
+                            }
                     except Exception as e:
-                        st.error(f"Ragic 秒數管理備註回寫例外：{e}")
+                        st.session_state["_ragic_upload_feedback"] = {
+                            "level": "error",
+                            "message": f"Ragic 秒數管理備註回寫例外：{e}",
+                            "lines": [f"例外：{e}"],
+                        }
 
                     if "_table1_cache_key" in st.session_state:
                         del st.session_state["_table1_cache_key"]
