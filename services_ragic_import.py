@@ -384,6 +384,12 @@ def _extract_segments_seconds_type_blocks(note_text: str) -> list[str]:
     return blocks
 
 
+def _extract_latest_segments_seconds_type_block(note_text: str) -> str:
+    """只取最後一段 Segments 秒數用途更新紀錄。"""
+    blocks = _extract_segments_seconds_type_blocks(note_text)
+    return blocks[-1] if blocks else ""
+
+
 def _remove_segments_seconds_type_blocks(note_text: str) -> str:
     """
     移除備註中所有【Segments 秒數用途更新紀錄】區塊，保留其他內容。
@@ -453,9 +459,10 @@ def _push_seconds_mgmt_to_ragic(
                     )
         except Exception:
             old_note = ""
-        preserved_blocks = _extract_segments_seconds_type_blocks(old_note)
-        if preserved_blocks:
-            remark = (remark + "\n\n" + "\n\n".join(preserved_blocks)).strip()
+        # 只保留最後一段 Segments 秒數用途更新紀錄，避免備註無限膨脹。
+        latest_block = _extract_latest_segments_seconds_type_block(old_note)
+        if latest_block:
+            remark = (remark + "\n\n" + latest_block).strip()
         remark = _truncate_seconds_remark(remark)
         ok, err = post_update_entry_fields(ref, rid, {str(fid_flag): flag, str(fid_note): remark}, api_key)
         if ok:
