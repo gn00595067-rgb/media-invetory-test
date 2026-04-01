@@ -254,15 +254,9 @@ def _update_worksheet_with_clear_when_empty(ws, df: pd.DataFrame, fallback_heade
         header = list(getattr(df, "columns", [])) if df is not None else list(fallback_header)
         if not header:
             header = list(fallback_header)
-        existing = ws.get_all_values() or []
-        if not existing:
-            ws.update([header] if header else [[""]], value_input_option="USER_ENTERED")
-            return
-        ncols = max(len(existing[0]), len(header))
-        header_padded = header + [""] * (ncols - len(header))
-        blank_row = [""] * ncols
-        new_values = [header_padded] + [blank_row] * (max(0, len(existing) - 1))
-        ws.update(new_values, value_input_option="USER_ENTERED")
+        # 清空時避免先讀全表（get_all_values）以降低 Read quota 壓力。
+        ws.clear()
+        ws.update([header] if header else [[""]], value_input_option="USER_ENTERED")
         return
 
     ws.update(_df_to_values(df), value_input_option="USER_ENTERED")
@@ -743,7 +737,7 @@ def sync_db_to_sheets(
     return errors
 
 
-def clear_business_tables_in_sheets(*, keep_users: bool = True) -> list[str]:
+def clear_business_tables_in_sheets(*, keep_users: bool = True, verify_after_clear: bool = False) -> list[str]:
     """
     直接清空 Google Sheet 的業務資料分頁（不依賴 DB 內容）。
     預設保留 Users 分頁不動。
@@ -815,24 +809,25 @@ def clear_business_tables_in_sheets(*, keep_users: bool = True) -> list[str]:
         except Exception as e:
             errors.append(f"{name}: {e}")
 
-    # 回讀驗證：若仍有非空資料列，視為清空失敗（避免 UI 顯示假成功）
-    try:
-        sh = _client()
-        if not sh:
-            errors.append("驗證失敗：無法連線 Google Sheet")
-        else:
-            for name, _, _ in table_jobs:
-                try:
-                    ws = sh.worksheet(name)
-                    values = ws.get_all_values() or []
-                    body_rows = values[1:] if len(values) > 1 else []
-                    has_non_empty = any(any(str(cell).strip() for cell in row) for row in body_rows)
-                    if has_non_empty:
-                        errors.append(f"{name}: 驗證未通過（仍有資料列）")
-                except Exception as e:
-                    errors.append(f"{name}: 驗證讀取失敗: {e}")
-    except Exception as e:
-        errors.append(f"驗證例外: {e}")
+    # 可選回讀驗證（預設關閉，避免觸發 Read requests quota）
+    if verify_after_clear:
+        try:
+            sh = _client()
+            if not sh:
+                errors.append("驗證失敗：無法連線 Google Sheet")
+            else:
+                for name, _, _ in table_jobs:
+                    try:
+                        ws = sh.worksheet(name)
+                        values = ws.get_all_values() or []
+                        body_rows = values[1:] if len(values) > 1 else []
+                        has_non_empty = any(any(str(cell).strip() for cell in row) for row in body_rows)
+                        if has_non_empty:
+                            errors.append(f"{name}: 驗證未通過（仍有資料列）")
+                    except Exception as e:
+                        errors.append(f"{name}: 驗證讀取失敗: {e}")
+        except Exception as e:
+            errors.append(f"驗證例外: {e}")
 
     reason = get_last_client_error()
     if errors and reason:

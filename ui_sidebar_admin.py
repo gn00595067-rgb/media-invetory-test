@@ -84,16 +84,8 @@ def render_sidebar_admin(
                 st.sidebar.error("Google Sheet 直接清空失敗：" + "; ".join(direct_clear_errs[:5]))
                 return
 
-            # 後備：再做一次 DB->Sheet 同步，避免欄位差異造成不一致
-            errs = sync_sheets_if_enabled(
-                only_tables=["Orders", "Segments", "PlatformSettings", "Capacity", "Purchase"],
-                skip_if_unchanged=False,
-            )
-            if errs:
-                st.sidebar.error("Google Sheet 同步失敗：" + "; ".join(errs[:5]))
-                return
-            else:
-                st.sidebar.success("✅ Google Sheet 已清空（Users 保留）")
+            # 直接清空成功即視為完成；避免再做第二輪同步造成 API 配額壓力
+            st.sidebar.success("✅ Google Sheet 已清空（Users 保留）")
             # 避免 app 重新啟動時又立刻從 Sheet 把資料灌回 DB
             st.session_state["_sheets_restored"] = True
             time.sleep(1)
