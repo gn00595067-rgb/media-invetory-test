@@ -370,8 +370,14 @@ def _push_seconds_mgmt_to_ragic(
         ok, err = post_update_entry_fields(ref, rid, {str(fid_flag): flag, str(fid_note): remark}, api_key)
         if ok:
             report_lines.append(f"RagicId {rid}：已寫入 秒數管理={flag}，備註長度={len(remark)} 字元")
+            report_lines.append("──────── 以下為寫入 Ragic「秒數管理(備註)」的全文（與表單欄位內容相同）────────")
+            report_lines.append(remark)
+            report_lines.append("")
         else:
             report_lines.append(f"RagicId {rid}：回寫失敗 — {err}")
+            report_lines.append("──────── 以下為本次擬寫入之備註全文（API 失敗時 Ragic 可能未更新）────────")
+            report_lines.append(remark)
+            report_lines.append("")
     return "\n".join(report_lines).strip() + "\n"
 
 
