@@ -7,8 +7,10 @@ from datetime import datetime, timedelta, date
 
 from services_cue_parser import (
     parse_cueapp_excel as service_parse_cueapp_excel,
+    parse_cueapp_excel_with_report as service_parse_cueapp_excel_with_report,
     parse_cue_excel_for_table1 as service_parse_cue_excel_for_table1,
     parse_excel_daily_ads as service_parse_excel_daily_ads,
+    quick_scan_cue_workbook as service_quick_scan_cue_workbook,
 )
 from services_table_builders import (
     build_daily_inventory_and_metrics as service_build_daily_inventory_and_metrics,
@@ -848,6 +850,8 @@ from app_shell import run_app_shell
 from ui_main_tabs import render_main_tabs
 
 parse_cueapp_excel = service_parse_cueapp_excel
+parse_cueapp_excel_with_report = service_parse_cueapp_excel_with_report
+quick_scan_cue_workbook = service_quick_scan_cue_workbook
 parse_excel_daily_ads = service_parse_excel_daily_ads
 parse_cue_excel_for_table1 = service_parse_cue_excel_for_table1
 
