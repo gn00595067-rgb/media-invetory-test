@@ -835,6 +835,126 @@ def clear_business_tables_in_sheets(*, keep_users: bool = True, verify_after_cle
     return errors
 
 
+def clear_business_tables_in_sheets_with_report(
+    *,
+    keep_users: bool = True,
+    verify_after_clear: bool = False,
+) -> tuple[list[str], list[str]]:
+    """
+    清空業務分頁並回傳詳細步驟訊息（供 UI 顯示進度/報告）。
+    """
+    errors: list[str] = []
+    reports: list[str] = []
+    table_jobs: list[tuple[str, list[str], Any]] = [
+        (
+            WS_ORDERS,
+            [
+                "id",
+                "platform",
+                "client",
+                "product",
+                "sales",
+                "company",
+                "start_date",
+                "end_date",
+                "seconds",
+                "spots",
+                "amount_net",
+                "updated_at",
+                "contract_id",
+                "seconds_type",
+                "project_amount_net",
+                "split_amount",
+                "region",
+            ],
+            write_orders_to_sheets,
+        ),
+        (
+            WS_SEGMENTS,
+            [
+                "segment_id",
+                "source_order_id",
+                "platform",
+                "channel",
+                "region",
+                "media_platform",
+                "company",
+                "sales",
+                "client",
+                "product",
+                "seconds",
+                "spots",
+                "start_date",
+                "end_date",
+                "duration_days",
+                "store_count",
+                "total_spots",
+                "total_store_seconds",
+                "seconds_type",
+                "created_at",
+                "updated_at",
+            ],
+            write_segments_to_sheets,
+        ),
+        (WS_PLATFORM_SETTINGS, ["platform", "store_count", "daily_hours"], write_platform_settings_to_sheets),
+        (WS_CAPACITY, ["media_platform", "year", "month", "daily_available_seconds"], write_capacity_to_sheets),
+        (WS_PURCHASE, ["media_platform", "year", "month", "purchased_seconds", "purchase_price"], write_purchase_to_sheets),
+    ]
+    if not keep_users:
+        table_jobs.append((WS_USERS, ["id", "username", "password_hash", "role", "created_at"], write_users_to_sheets))
+
+    for name, cols, writer in table_jobs:
+        reports.append(f"開始清空 `{name}`")
+        try:
+            err = writer(pd.DataFrame(columns=cols))
+            if err:
+                msg = f"{name}: {err}"
+                errors.append(msg)
+                reports.append(f"失敗：{msg}")
+            else:
+                reports.append(f"完成：`{name}`")
+        except Exception as e:
+            msg = f"{name}: {e}"
+            errors.append(msg)
+            reports.append(f"例外：{msg}")
+
+    if verify_after_clear:
+        reports.append("開始回讀驗證")
+        try:
+            sh = _client()
+            if not sh:
+                msg = "驗證失敗：無法連線 Google Sheet"
+                errors.append(msg)
+                reports.append(msg)
+            else:
+                for name, _, _ in table_jobs:
+                    try:
+                        ws = sh.worksheet(name)
+                        values = ws.get_all_values() or []
+                        body_rows = values[1:] if len(values) > 1 else []
+                        has_non_empty = any(any(str(cell).strip() for cell in row) for row in body_rows)
+                        if has_non_empty:
+                            msg = f"{name}: 驗證未通過（仍有資料列）"
+                            errors.append(msg)
+                            reports.append(msg)
+                        else:
+                            reports.append(f"驗證通過：`{name}`")
+                    except Exception as e:
+                        msg = f"{name}: 驗證讀取失敗: {e}"
+                        errors.append(msg)
+                        reports.append(msg)
+        except Exception as e:
+            msg = f"驗證例外: {e}"
+            errors.append(msg)
+            reports.append(msg)
+
+    reason = get_last_client_error()
+    if errors and reason:
+        errors.insert(0, reason)
+        reports.insert(0, f"客戶端錯誤：{reason}")
+    return errors, reports
+
+
 def run_sheets_healthcheck() -> tuple[bool, str]:
     """
     Google Sheet 連線與寫入健康檢查。

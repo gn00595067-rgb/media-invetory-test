@@ -10,6 +10,13 @@ import pandas as pd
 import streamlit as st
 
 
+def _render_reset_progress(lines: list[str], progress: float) -> None:
+    pct = max(0, min(100, int(progress * 100)))
+    st.sidebar.progress(progress, text=f"重置進度 {pct}%")
+    body = "\n".join(lines[-10:]) if lines else "準備中..."
+    st.sidebar.code(body, language="text")
+
+
 def render_sidebar_admin(
     *,
     get_db_connection: Callable[[], object],
@@ -54,6 +61,8 @@ def render_sidebar_admin(
 
     if st.sidebar.button("🧨 重置資料庫（清空資料，保留 Users）", help="⚠️ 警告：會清空主要業務資料，保留帳號權限"):
         try:
+            progress_lines: list[str] = ["開始重置流程"]
+            _render_reset_progress(progress_lines, 0.05)
             # 改為直接清空資料表，避免依賴 db 檔路徑導致「看似重置、實際未清空」。
             init_db()
             conn = get_db_connection()
@@ -69,22 +78,36 @@ def render_sidebar_admin(
                 conn.commit()
             finally:
                 conn.close()
+            progress_lines.append("本地資料庫已清空（Users 保留）")
+            _render_reset_progress(progress_lines, 0.35)
 
             st.sidebar.success("✅ 已清空資料庫資料（Users 保留）")
 
             # 同步到 Google Sheet：只清空非 Users 工作表
-            from sheets_backend import is_sheets_enabled, clear_business_tables_in_sheets
+            from sheets_backend import (
+                is_sheets_enabled,
+                clear_business_tables_in_sheets_with_report,
+            )
 
             if not is_sheets_enabled():
                 st.sidebar.error("Google Sheet 未啟用或設定不完整：此次不會顯示清空成功。")
                 return
             # 優先直接清空 Sheet（不依賴 DB 同步），確保畫面可立即清空
-            direct_clear_errs = clear_business_tables_in_sheets(keep_users=True)
+            progress_lines.append("開始清空 Google Sheet 分頁")
+            _render_reset_progress(progress_lines, 0.5)
+            direct_clear_errs, step_reports = clear_business_tables_in_sheets_with_report(
+                keep_users=True,
+                verify_after_clear=False,
+            )
+            progress_lines.extend(step_reports)
+            _render_reset_progress(progress_lines, 0.9)
             if direct_clear_errs:
                 st.sidebar.error("Google Sheet 直接清空失敗：" + "; ".join(direct_clear_errs[:5]))
                 return
 
             # 直接清空成功即視為完成；避免再做第二輪同步造成 API 配額壓力
+            progress_lines.append("全部完成")
+            _render_reset_progress(progress_lines, 1.0)
             st.sidebar.success("✅ Google Sheet 已清空（Users 保留）")
             # 避免 app 重新啟動時又立刻從 Sheet 把資料灌回 DB
             st.session_state["_sheets_restored"] = True
