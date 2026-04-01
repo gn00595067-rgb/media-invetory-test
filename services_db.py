@@ -27,6 +27,9 @@ def init_db(*, get_db_connection, hash_password):
             if "split_amount" not in current_cols:
                 c.execute("ALTER TABLE orders ADD COLUMN split_amount REAL")
                 conn.commit()
+            if "region" not in current_cols:
+                c.execute("ALTER TABLE orders ADD COLUMN region TEXT")
+                conn.commit()
     if not exists:
         c.execute(
             """
@@ -34,7 +37,8 @@ def init_db(*, get_db_connection, hash_password):
                 id TEXT PRIMARY KEY,
                 platform TEXT, client TEXT, product TEXT, sales TEXT, company TEXT,
                 start_date TEXT, end_date TEXT, seconds INTEGER, spots INTEGER, amount_net REAL,
-                updated_at TIMESTAMP, contract_id TEXT, seconds_type TEXT, project_amount_net REAL, split_amount REAL
+                updated_at TIMESTAMP, contract_id TEXT, seconds_type TEXT, project_amount_net REAL, split_amount REAL,
+                region TEXT
             )
         """
         )

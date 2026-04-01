@@ -29,6 +29,9 @@ def build_ad_flight_segments(
                 if pd.isna(row["spots"]) or row["spots"] <= 0:
                     continue
                 platform, channel, region = parse_platform_region_fn(row["platform"])
+                row_region = str(row.get("region", "")).strip() if row.get("region", None) is not None else ""
+                if row_region:
+                    region = row_region
                 media_platform = get_media_platform_display_fn(platform, channel, row.get("platform", ""))
                 if platform not in ["全家", "家樂福"]:
                     continue

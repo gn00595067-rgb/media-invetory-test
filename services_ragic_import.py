@@ -66,6 +66,7 @@ def _make_ragic_order_id(
     end_date: str,
     seconds: int,
     spots: int,
+    region: str = "",
 ) -> str:
     """用穩定鍵產生 order_id，避免每次匯入都新建不同 id。"""
     stable_key = "|".join(
@@ -85,6 +86,7 @@ def _make_ragic_order_id(
                 end_date or "",
                 int(seconds or 0),
                 int(spots or 0),
+                region or "",
             ],
         )
     )
@@ -104,6 +106,7 @@ def _order_match_key(
     seconds: int,
     spots: int,
     contract_id: str,
+    region: str = "",
 ) -> tuple:
     return (
         str(platform or "").strip(),
@@ -116,6 +119,7 @@ def _order_match_key(
         int(seconds or 0),
         int(spots or 0),
         str(contract_id or "").strip(),
+        str(region or "").strip(),
     )
 
 
@@ -126,7 +130,7 @@ def _load_existing_order_id_map(get_db_connection: Callable[[], object]) -> dict
         conn = get_db_connection()
         df_old = pd.read_sql(
             """
-            SELECT id, platform, client, product, sales, company, start_date, end_date, seconds, spots, contract_id
+            SELECT id, platform, client, product, sales, company, start_date, end_date, seconds, spots, contract_id, region
             FROM orders
             """,
             conn,
@@ -143,6 +147,7 @@ def _load_existing_order_id_map(get_db_connection: Callable[[], object]) -> dict
                 seconds=r.get("seconds", 0),
                 spots=r.get("spots", 0),
                 contract_id=r.get("contract_id", ""),
+                region=r.get("region", ""),
             )
             oid = str(r.get("id") or "").strip()
             if oid:
@@ -185,12 +190,14 @@ def _signature_from_existing_row(r: dict, effective_seconds_type: str) -> tuple:
         _norm_text(effective_seconds_type),
         _norm_num(r.get("project_amount_net", 0)),
         _norm_num(r.get("split_amount", 0)),
+        _norm_text(r.get("region", "")),
     )
 
 
 def _signature_from_tuple(t: tuple, effective_seconds_type: str) -> tuple:
     project_val = t[14] if len(t) > 14 else None
     split_val = t[15] if len(t) > 15 else None
+    region_val = t[16] if len(t) > 16 else ""
     return (
         _norm_text(t[1]),
         _norm_text(t[2]),
@@ -206,6 +213,7 @@ def _signature_from_tuple(t: tuple, effective_seconds_type: str) -> tuple:
         _norm_text(effective_seconds_type),
         _norm_num(project_val),
         _norm_num(split_val),
+        _norm_text(region_val),
     )
 
 
@@ -606,6 +614,7 @@ def _ragic_entry_collect_order_rows(
                 seconds=seconds,
                 spots=spots,
                 contract_id=str(order_no),
+                region=region,
             )
             order_id = existing_order_id_map.get(match_key) or _make_ragic_order_id(
                 ragic_id=str(ragic_id),
@@ -621,6 +630,7 @@ def _ragic_entry_collect_order_rows(
                 end_date=end_date_norm,
                 seconds=seconds,
                 spots=spots,
+                region=region,
             )
             rows_out.append(
                 (
@@ -642,6 +652,7 @@ def _ragic_entry_collect_order_rows(
                         "",
                         project_amount if project_amount and project_amount > 0 else None,
                         None,
+                        region,
                     ),
                 )
             )
@@ -860,7 +871,7 @@ def import_ragic_to_orders_by_date_range_service(
         existing_rows: dict[str, dict] = {}
         df_existing = pd.read_sql(
             """
-            SELECT id, platform, client, product, sales, company, start_date, end_date, seconds, spots, amount_net, contract_id, seconds_type, project_amount_net, split_amount
+            SELECT id, platform, client, product, sales, company, start_date, end_date, seconds, spots, amount_net, contract_id, seconds_type, project_amount_net, split_amount, region
             FROM orders
             """,
             conn,
@@ -907,8 +918,8 @@ def import_ragic_to_orders_by_date_range_service(
         c.executemany(
             """
             INSERT INTO orders
-            (id, platform, client, product, sales, company, start_date, end_date, seconds, spots, amount_net, updated_at, contract_id, seconds_type, project_amount_net, split_amount)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            (id, platform, client, product, sales, company, start_date, end_date, seconds, spots, amount_net, updated_at, contract_id, seconds_type, project_amount_net, split_amount, region)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
                 platform=excluded.platform,
                 client=excluded.client,
@@ -927,7 +938,8 @@ def import_ragic_to_orders_by_date_range_service(
                     ELSE excluded.seconds_type
                 END,
                 project_amount_net=excluded.project_amount_net,
-                split_amount=excluded.split_amount
+                split_amount=excluded.split_amount,
+                region=excluded.region
             WHERE
                 COALESCE(orders.platform, '') != COALESCE(excluded.platform, '')
                 OR COALESCE(orders.client, '') != COALESCE(excluded.client, '')
@@ -949,6 +961,7 @@ def import_ragic_to_orders_by_date_range_service(
                 )
                 OR COALESCE(orders.project_amount_net, 0) != COALESCE(excluded.project_amount_net, 0)
                 OR COALESCE(orders.split_amount, 0) != COALESCE(excluded.split_amount, 0)
+                OR COALESCE(orders.region, '') != COALESCE(excluded.region, '')
             """,
             order_rows,
         )
@@ -1144,7 +1157,7 @@ def import_ragic_single_entry_to_orders_service(
         existing_rows: dict[str, dict] = {}
         df_existing = pd.read_sql(
             """
-            SELECT id, platform, client, product, sales, company, start_date, end_date, seconds, spots, amount_net, contract_id, seconds_type, project_amount_net, split_amount
+            SELECT id, platform, client, product, sales, company, start_date, end_date, seconds, spots, amount_net, contract_id, seconds_type, project_amount_net, split_amount, region
             FROM orders
             """,
             conn,
@@ -1191,8 +1204,8 @@ def import_ragic_single_entry_to_orders_service(
         c.executemany(
             """
             INSERT INTO orders
-            (id, platform, client, product, sales, company, start_date, end_date, seconds, spots, amount_net, updated_at, contract_id, seconds_type, project_amount_net, split_amount)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            (id, platform, client, product, sales, company, start_date, end_date, seconds, spots, amount_net, updated_at, contract_id, seconds_type, project_amount_net, split_amount, region)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
                 platform=excluded.platform,
                 client=excluded.client,
@@ -1211,7 +1224,8 @@ def import_ragic_single_entry_to_orders_service(
                     ELSE excluded.seconds_type
                 END,
                 project_amount_net=excluded.project_amount_net,
-                split_amount=excluded.split_amount
+                split_amount=excluded.split_amount,
+                region=excluded.region
             WHERE
                 COALESCE(orders.platform, '') != COALESCE(excluded.platform, '')
                 OR COALESCE(orders.client, '') != COALESCE(excluded.client, '')
@@ -1233,6 +1247,7 @@ def import_ragic_single_entry_to_orders_service(
                 )
                 OR COALESCE(orders.project_amount_net, 0) != COALESCE(excluded.project_amount_net, 0)
                 OR COALESCE(orders.split_amount, 0) != COALESCE(excluded.split_amount, 0)
+                OR COALESCE(orders.region, '') != COALESCE(excluded.region, '')
             """,
             order_rows,
         )
