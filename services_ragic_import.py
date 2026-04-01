@@ -326,6 +326,12 @@ def _compose_seconds_mgmt_remark(*, state: dict, batch_id: str, seconds_type_not
         )
         lines.extend(state["cue_excel_layout_sections"])
         lines.append("")
+    if state.get("cue_structural_reports"):
+        lines.append(
+            "【CUE 結構化判讀（版型、主表頭列、各欄標題、秒數／日期區間、有意義列與卡住點；含模擬表節錄）】"
+        )
+        lines.extend(state["cue_structural_reports"])
+        lines.append("")
     if state.get("file_logs"):
         lines.append("【各 CUE 檔處理】")
         for fl in state["file_logs"]:
@@ -426,6 +432,7 @@ def _ragic_entry_collect_order_rows(
         "skipped_summaries": [],
         "seconds_type_notes": [],
         "cue_excel_layout_sections": [],
+        "cue_structural_reports": [],
     }
 
     rows_out: list[tuple[str, tuple]] = []
@@ -511,6 +518,11 @@ def _ragic_entry_collect_order_rows(
             state["cue_excel_layout_sections"].append(
                 f"──── 檔案#{file_i}（{flog.get('token_short', '')}）────\n"
                 + "\n\n".join(cue_layout_sec)
+            )
+        if cue_struct_sec:
+            state["cue_structural_reports"].append(
+                f"──── 檔案#{file_i}（{flog.get('token_short', '')}）────\n"
+                + "\n\n".join(cue_struct_sec)
             )
         if not cue_units:
             state["file_logs"].append(flog)

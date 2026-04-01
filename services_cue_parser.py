@@ -494,6 +494,232 @@ def format_cue_sheet_matrix_for_report(
     return "\n".join(lines)
 
 
+def _merged_header_label(df: pd.DataFrame, r0: int, r1: int, j: int) -> str:
+    parts: list[str] = []
+    for r in (r0, r1):
+        if 0 <= r < len(df) and j < df.shape[1]:
+            v = df.iloc[r, j]
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                continue
+            s = str(v).replace("\n", " ").strip()
+            if s and s.lower() != "nan":
+                parts.append(s)
+    return "｜".join(parts) if parts else ""
+
+
+def analyze_cue_sheet_structure(df: pd.DataFrame, sheet_name: str) -> dict:
+    """
+    結構化判讀：模擬矩陣、版型、主表頭兩列、各欄標題、秒數／檔次／日期欄區間、
+    數字日期列、表頭下方「有意義列」（時段＋秒數格＋日期區檔次），與卡住點。
+    """
+    out: dict = {
+        "sheet_name": sheet_name,
+        "shape": (len(df), df.shape[1]),
+        "matrix_preview": "",
+        "vendor": None,
+        "vendor_notes": [],
+        "title_row_pair": (None, None),
+        "column_labels": {},
+        "seconds_col": None,
+        "slots_col": None,
+        "date_col_start": None,
+        "date_col_end": None,
+        "numeric_day_row": None,
+        "month_hints": [],
+        "meaningful_rows": [],
+        "blockers": [],
+        "layout_usable": False,
+        "primary_data_row": None,
+    }
+    try:
+        out["matrix_preview"] = format_cue_sheet_matrix_for_report(
+            df, sheet_name, max_rows=45, max_cols=42, cell_max=16
+        )
+    except Exception as e:
+        out["matrix_preview"] = f"（矩陣輸出失敗：{e}）"
+
+    top = _cueapp_top_block_text(df, max_rows=22)
+    a1 = str(df.iloc[0, 0]).strip() if df.shape[1] else ""
+    out["vendor"], out["vendor_notes"] = detect_cue_vendor_from_sheet_block(top, sheet_name, first_cell_a1=a1)
+
+    hi = None
+    for i in range(min(50, len(df) - 1)):
+        pair = _row_text_df(df, i) + " " + _row_text_df(df, i + 1)
+        if _schedule_header_text_matches(pair):
+            hi = i
+            break
+    if hi is None:
+        out["blockers"].append("未找到「頻道＋播出＋秒數線索」之表頭列對（合併相鄰兩列文字判斷）。")
+        return out
+
+    out["title_row_pair"] = (hi, hi + 1)
+    nc = min(int(df.shape[1]), 50)
+    labels: dict[int, str] = {}
+    for j in range(nc):
+        labels[j] = _merged_header_label(df, hi, hi + 1, j)
+    out["column_labels"] = labels
+
+    slots_j = None
+    for j in range(nc):
+        lb = labels[j]
+        if "檔次" in lb:
+            slots_j = j
+            break
+
+    seconds_j = None
+    upper = slots_j if slots_j is not None else nc
+    for j in range(upper - 1, -1, -1):
+        lb = labels[j]
+        if not lb:
+            continue
+        ls = lb.lower()
+        if "秒" in lb or "size" in ls:
+            seconds_j = j
+            break
+
+    if seconds_j is None:
+        out["blockers"].append("表頭合併欄名中，在「檔次」左側找不到含「秒」或 Size 之欄（秒數規格）。")
+    if slots_j is None:
+        out["blockers"].append("表頭合併欄名中找不到「檔次」欄，無法用「秒數…檔次」夾出日期區。")
+
+    date_s = date_e = None
+    if seconds_j is not None and slots_j is not None and slots_j > seconds_j + 1:
+        date_s = seconds_j + 1
+        date_e = slots_j - 1
+    elif seconds_j is not None:
+        date_s = seconds_j + 1
+        date_e = min(seconds_j + 40, nc - 1)
+
+    if date_s is not None and date_e is not None and date_e >= date_s:
+        out["seconds_col"] = seconds_j
+        out["slots_col"] = slots_j
+        out["date_col_start"] = date_s
+        out["date_col_end"] = date_e
+    elif not out["blockers"]:
+        out["blockers"].append("無法決定日期欄起訖索引。")
+
+    for r in range(max(0, hi - 6), min(len(df), hi + 3)):
+        mm = _row_month_hint_from_text(df, r, max_col=nc)
+        if mm is not None:
+            out["month_hints"].append({"row_0based": r, "month": mm})
+
+    best_r, best_cnt = None, -1
+    if date_s is not None and date_e is not None:
+        for r in range(hi + 1, min(len(df), hi + 12)):
+            cnt = sum(
+                1
+                for j in range(date_s, min(date_e + 1, df.shape[1]))
+                if _parse_cueapp_day_header_cell(df.iloc[r, j]) is not None
+            )
+            if cnt > best_cnt:
+                best_cnt, best_r = cnt, r
+        if best_cnt >= 3:
+            out["numeric_day_row"] = best_r
+        else:
+            out["blockers"].append(
+                f"表頭下方未找到足夠「幾日」數字列：在欄 {date_s}-{date_e} 最多僅 {best_cnt} 格（需≥3）。"
+            )
+
+    nd = (date_e - date_s + 1) if (date_s is not None and date_e is not None) else 0
+    if date_s is not None and seconds_j is not None:
+        for r in range(hi + 2, min(len(df), hi + 55)):
+            if _row_looks_like_weekday_subheader(df, r, date_s, max(3, nd)):
+                out["meaningful_rows"].append(
+                    {"row_0based": r, "score": 0, "hits": ["週幾子表頭"], "skip": True}
+                )
+                continue
+            row = df.iloc[r]
+            if seconds_j < len(row):
+                tcell = str(row.iloc[seconds_j]).strip().lower()
+                if "total" in tcell:
+                    out["meaningful_rows"].append(
+                        {"row_0based": r, "score": 0, "hits": ["秒數欄為 Total，表尾"], "stop": True}
+                    )
+                    break
+
+            hits: list[str] = []
+            score = 0
+            for j in range(0, min(seconds_j + 1, len(row))):
+                cell = str(row.iloc[j])
+                if _TIME_RANGE_RE.search(cell) or ("07:" in cell and "23:" in cell):
+                    score += 3
+                    hits.append(f"欄{j}播出時段")
+                    break
+            if seconds_j < len(row):
+                sc = str(row.iloc[seconds_j])
+                if re.search(r"\d+\s*秒", sc) or ("秒" in sc and "廣告" in sc):
+                    score += 2
+                    hits.append(f"欄{seconds_j}秒數格")
+            nspot = 0
+            if date_s is not None and date_e is not None:
+                for c in range(date_s, min(date_e + 1, len(row))):
+                    if 0 < _safe_spots(row.iloc[c]) <= 50:
+                        nspot += 1
+            if nspot >= 2:
+                score += min(5, nspot + 1)
+                hits.append(f"日期欄區{nspot}格有檔次(1-50)")
+
+            if score >= 5 or (nspot >= 3 and score >= 2):
+                out["meaningful_rows"].append({"row_0based": r, "score": score, "hits": hits})
+
+    for m in out["meaningful_rows"]:
+        if not m.get("skip") and not m.get("stop") and m.get("score", 0) > 0:
+            out["primary_data_row"] = m["row_0based"]
+            break
+
+    out["layout_usable"] = bool(
+        out["seconds_col"] is not None
+        and out["date_col_start"] is not None
+        and out["date_col_end"] is not None
+        and out["numeric_day_row"] is not None
+        and out["date_col_end"] >= out["date_col_start"]
+    )
+    return out
+
+
+def format_structure_report_zh(st: dict) -> str:
+    lines = [
+        f"══ 結構化判讀「{st.get('sheet_name', '')}」══",
+        f"（1）版型：{st.get('vendor') or 'unknown'}　" + "；".join(st.get("vendor_notes") or []),
+        f"（2）表形：{st['shape'][0]} 列 × {st['shape'][1]} 欄",
+    ]
+    tr = st.get("title_row_pair") or (None, None)
+    if tr[0] is not None:
+        lines.append(
+            f"（3）主標題列（0-based）：第 {tr[0]} 列與第 {tr[1]} 列合併讀欄名"
+        )
+    labs = st.get("column_labels") or {}
+    if labs:
+        parts = [f"[{j}]「{t[:36]}{'…' if len(str(t)) > 36 else ''}」" for j, t in sorted(labs.items()) if t]
+        lines.append("（3b）各欄標題：" + " ".join(parts[:24]))
+        if len(parts) > 24:
+            lines.append(f"　…其餘 {len(parts) - 24} 欄略")
+    lines.append(
+        f"（4）秒數欄索引={st.get('seconds_col')}；檔次欄索引={st.get('slots_col')}；"
+        f"日期欄（含）={st.get('date_col_start')}…{st.get('date_col_end')}"
+    )
+    lines.append(f"（5）數字「幾日」表頭列（0-based）={st.get('numeric_day_row')}")
+    if st.get("month_hints"):
+        lines.append("（5b）月份線索：" + str(st["month_hints"]))
+    lines.append("（6）表頭下方有意義列（關鍵字命中；0-based 列號）：")
+    for m in st.get("meaningful_rows") or []:
+        r1 = m["row_0based"] + 1
+        if m.get("stop"):
+            lines.append(f"　‧列{r1} → STOP {m.get('hits')}")
+            break
+        tag = "（略過）" if m.get("skip") else ""
+        lines.append(f"　‧列{r1} score={m.get('score', 0)} {tag}{m.get('hits')}")
+    lines.append(
+        f"（7）layout_usable={st.get('layout_usable')}；"
+        f"建議第一筆資料列（0-based）={st.get('primary_data_row')}"
+    )
+    if st.get("blockers"):
+        lines.append("（8）卡住／待確認：" + " | ".join(st["blockers"]))
+    lines.append("（9）【模擬表陣列節錄】")
+    lines.append(st.get("matrix_preview") or "")
+    return "\n".join(lines)
+
+
 def _extract_seconds_from_cell(val):
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return 0
@@ -513,6 +739,7 @@ def parse_cueapp_excel(
     file_content,
     diagnostics_out: list | None = None,
     layout_sections_out: list | None = None,
+    structural_reports_out: list | None = None,
 ):
     result = []
     try:
@@ -571,6 +798,8 @@ def parse_cueapp_excel(
             sec_col: int | None = None
             schedule_day_row: int | None = None
             data_start_row: int | None = None
+            bolin_data_start_locked = False
+            date_grid_last_j: int | None = None
 
             def _parse_day_cell(v):
                 v = _cell_val(v)
@@ -708,89 +937,179 @@ def parse_cueapp_excel(
                     end_date = max(dates2)
             else:
                 start_date, end_date = _parse_cueapp_period_shenghuo_bolin(df)
-                header_row_idx = _find_cueapp_schedule_header_row(df)
-                if header_row_idx is None:
-                    _diag("聲活／鉑霖：找不到排程表頭列（頻道、秒數線索、播出地區等）。")
-                    continue
-                sec_guess = _find_cueapp_sec_col(df, header_row_idx)
-                if sec_guess is None:
-                    _diag("聲活／鉑霖：找不到秒數／Size 欄（含 15秒廣告 等形式）。")
-                    continue
-                # 自第 3 欄起掃「幾日」數字，避免誤用表頭上方「廣告規格／15秒」附近的欄位
-                schedule_day_row, pick_notes = _pick_numeric_day_header_row(df, header_row_idx, 3, None)
-                for note in pick_notes:
-                    _diag(note)
-                first_day_j = _find_first_day_column_streak(df, schedule_day_row, min_col=2, max_col=min(55, df.shape[1]))
-                if first_day_j is not None:
-                    sec_col = first_day_j - 1
-                    date_start_col = first_day_j
-                    if not _cue_header_seconds_like(df, schedule_day_row, sec_col):
-                        _diag(
-                            f"欄位幾何：日期數字區起於欄索引 {first_day_j}（左鄰 {sec_col} 表頭未含秒數／規格關鍵字），"
-                            "仍採左鄰為秒數欄；若檔次仍為 0 請檢查合併格。"
-                        )
-                    elif sec_guess != sec_col:
-                        _diag(
-                            f"秒數欄校正：表頭先掃到索引 {sec_guess}，依「幾日」連續區左界改為 {sec_col}（避免誤用較早的 15 秒欄）。"
-                        )
-                else:
-                    sec_col = sec_guess
-                    date_start_col = sec_guess + 1
-                    _diag("未在數字日期列偵測到連續「幾日」區塊，退回初次秒數掃描決定日期起欄。")
-                flex_month = _infer_month_neighborhood(df, schedule_day_row)
-                if flex_month is not None:
-                    _diag(f"月份提示：表頭鄰近掃到「{flex_month} 月」（與執行期間併用於拼日期）。")
-
-                day_cols = []
-                for j in range(date_start_col, min(df.shape[1], date_start_col + 80)):
-                    d = _parse_day_cell(df.iloc[schedule_day_row, j])
-                    if d is None:
-                        if day_cols:
-                            break
-                        continue
-                    day_cols.append((j, d))
-                if not day_cols:
-                    _diag(
-                        f"在「幾日」數字列（第 {schedule_day_row + 1} 列）右側未找到連續日期欄（1–31）；"
-                        "常見原因：日期與週幾分行、上方另有「N月」列、或合併格導致空白。"
-                    )
-                    continue
-                eff_days = len(day_cols)
-
-                year = _infer_year_from_df(df) or (start_date.year if start_date else None)
-                if year is None:
-                    year = datetime.now().year
-                months = []
-                last_day = None
-                last_month = None
-                base_month = (start_date.month if start_date else None) or flex_month
-                if base_month is None:
-                    _diag("未由執行期間或「N月」列取得月份，將依欄位上方逐欄推斷或沿用上一欄月份；跨月請人工核對。")
-                for j, d in day_cols:
-                    mm = _infer_month_for_col(df, schedule_day_row, j) or base_month
-                    if mm is None:
-                        if last_month is None:
-                            mm = 1
-                        else:
-                            mm = last_month
-                    if last_day is not None and d < last_day and (mm == last_month):
-                        mm = 1 if last_month == 12 else (last_month + 1)
-                    months.append(mm)
-                    last_day = d
-                    last_month = mm
-
-                dates = []
-                for (_, d), mm in zip(day_cols, months):
+                if structural_reports_out is not None:
                     try:
-                        dates.append(date(year, int(mm), int(d)))
+                        st0 = analyze_cue_sheet_structure(df, sheet_name)
+                        structural_reports_out.append(format_structure_report_zh(st0))
+                    except Exception as ex:
+                        structural_reports_out.append(f"[{sheet_name}] 結構化判讀失敗：{ex}")
+                        st0 = {}
+                else:
+                    try:
+                        st0 = analyze_cue_sheet_structure(df, sheet_name)
                     except Exception:
-                        dates.append(None)
-                dates = [dt for dt in dates if dt is not None]
-                if not dates:
-                    _diag("聲活／鉑霖：無法由「幾日」與月份組出有效西曆日期。")
-                    continue
-                start_date = start_date or min(dates)
-                end_date = end_date or max(dates)
+                        st0 = {}
+
+                structure_ok = False
+                if (
+                    isinstance(st0, dict)
+                    and st0.get("layout_usable")
+                    and st0.get("numeric_day_row") is not None
+                    and st0.get("date_col_start") is not None
+                    and st0.get("date_col_end") is not None
+                ):
+                    ds, de = int(st0["date_col_start"]), int(st0["date_col_end"])
+                    sdr = int(st0["numeric_day_row"])
+                    day_cols_try: list[tuple[int, int]] = []
+                    for j in range(ds, min(de + 1, df.shape[1])):
+                        d = _parse_day_cell(df.iloc[sdr, j])
+                        if d is None:
+                            if day_cols_try:
+                                break
+                            continue
+                        day_cols_try.append((j, d))
+                    if len(day_cols_try) >= 3:
+                        structure_ok = True
+                        header_row_idx = st0["title_row_pair"][0]
+                        sec_col = int(st0["seconds_col"])
+                        date_start_col = ds
+                        schedule_day_row = sdr
+                        day_cols = day_cols_try
+                        date_grid_last_j = day_cols[-1][0]
+                        eff_days = len(day_cols)
+                        if st0.get("primary_data_row") is not None:
+                            data_start_row = int(st0["primary_data_row"])
+                            bolin_data_start_locked = True
+                        _diag(
+                            f"結構化判讀已採用：秒數欄={sec_col}、日期欄 {ds}-{de}、"
+                            f"數字日期列={sdr}、共 {eff_days} 天；"
+                            f"有意義列 score 最高起點列={data_start_row if bolin_data_start_locked else '（稍後自動掃）'}"
+                        )
+                        flex_month = _infer_month_neighborhood(df, schedule_day_row)
+                        if flex_month is not None:
+                            _diag(f"月份提示：表頭鄰近掃到「{flex_month} 月」（與執行期間併用於拼日期）。")
+                        year = _infer_year_from_df(df) or (start_date.year if start_date else None)
+                        if year is None:
+                            year = datetime.now().year
+                        months = []
+                        last_day = None
+                        last_month = None
+                        base_month = (start_date.month if start_date else None) or flex_month
+                        if base_month is None:
+                            _diag(
+                                "未由執行期間或「N月」列取得月份，將依欄位上方逐欄推斷或沿用上一欄月份；跨月請人工核對。"
+                            )
+                        for j, d in day_cols:
+                            mm = _infer_month_for_col(df, schedule_day_row, j) or base_month
+                            if mm is None:
+                                mm = last_month if last_month is not None else 1
+                            if last_day is not None and d < last_day and (mm == last_month):
+                                mm = 1 if last_month == 12 else (last_month + 1)
+                            months.append(mm)
+                            last_day = d
+                            last_month = mm
+                        dates = []
+                        for (_, d), mm in zip(day_cols, months):
+                            try:
+                                dates.append(date(year, int(mm), int(d)))
+                            except Exception:
+                                dates.append(None)
+                        dates = [dt for dt in dates if dt is not None]
+                        if not dates:
+                            _diag("結構化路徑：無法由「幾日」與月份組出有效西曆日期，改走備援邏輯。")
+                            structure_ok = False
+                        else:
+                            start_date = start_date or min(dates)
+                            end_date = end_date or max(dates)
+
+                if not structure_ok:
+                    header_row_idx = _find_cueapp_schedule_header_row(df)
+                    if header_row_idx is None:
+                        _diag("聲活／鉑霖：找不到排程表頭列（頻道、秒數線索、播出地區等）。")
+                        continue
+                    sec_guess = _find_cueapp_sec_col(df, header_row_idx)
+                    if sec_guess is None:
+                        _diag("聲活／鉑霖：找不到秒數／Size 欄（含 15秒廣告 等形式）。")
+                        continue
+                    schedule_day_row, pick_notes = _pick_numeric_day_header_row(df, header_row_idx, 3, None)
+                    for note in pick_notes:
+                        _diag(note)
+                    first_day_j = _find_first_day_column_streak(
+                        df, schedule_day_row, min_col=2, max_col=min(55, df.shape[1])
+                    )
+                    if first_day_j is not None:
+                        sec_col = first_day_j - 1
+                        date_start_col = first_day_j
+                        if not _cue_header_seconds_like(df, schedule_day_row, sec_col):
+                            _diag(
+                                f"欄位幾何：日期數字區起於欄索引 {first_day_j}（左鄰 {sec_col} 表頭未含秒數／規格關鍵字），"
+                                "仍採左鄰為秒數欄；若檔次仍為 0 請檢查合併格。"
+                            )
+                        elif sec_guess != sec_col:
+                            _diag(
+                                f"秒數欄校正：表頭先掃到索引 {sec_guess}，依「幾日」連續區左界改為 {sec_col}（避免誤用較早的 15 秒欄）。"
+                            )
+                    else:
+                        sec_col = sec_guess
+                        date_start_col = sec_guess + 1
+                        _diag("未在數字日期列偵測到連續「幾日」區塊，退回初次秒數掃描決定日期起欄。")
+                    flex_month = _infer_month_neighborhood(df, schedule_day_row)
+                    if flex_month is not None:
+                        _diag(f"月份提示：表頭鄰近掃到「{flex_month} 月」（與執行期間併用於拼日期）。")
+
+                    day_cols = []
+                    for j in range(date_start_col, min(df.shape[1], date_start_col + 80)):
+                        d = _parse_day_cell(df.iloc[schedule_day_row, j])
+                        if d is None:
+                            if day_cols:
+                                break
+                            continue
+                        day_cols.append((j, d))
+                    if not day_cols:
+                        _diag(
+                            f"在「幾日」數字列（第 {schedule_day_row + 1} 列）右側未找到連續日期欄（1–31）；"
+                            "常見原因：日期與週幾分行、上方另有「N月」列、或合併格導致空白。"
+                        )
+                        continue
+                    eff_days = len(day_cols)
+                    date_grid_last_j = day_cols[-1][0]
+
+                    year = _infer_year_from_df(df) or (start_date.year if start_date else None)
+                    if year is None:
+                        year = datetime.now().year
+                    months = []
+                    last_day = None
+                    last_month = None
+                    base_month = (start_date.month if start_date else None) or flex_month
+                    if base_month is None:
+                        _diag(
+                            "未由執行期間或「N月」列取得月份，將依欄位上方逐欄推斷或沿用上一欄月份；跨月請人工核對。"
+                        )
+                    for j, d in day_cols:
+                        mm = _infer_month_for_col(df, schedule_day_row, j) or base_month
+                        if mm is None:
+                            if last_month is None:
+                                mm = 1
+                            else:
+                                mm = last_month
+                        if last_day is not None and d < last_day and (mm == last_month):
+                            mm = 1 if last_month == 12 else (last_month + 1)
+                        months.append(mm)
+                        last_day = d
+                        last_month = mm
+
+                    dates = []
+                    for (_, d), mm in zip(day_cols, months):
+                        try:
+                            dates.append(date(year, int(mm), int(d)))
+                        except Exception:
+                            dates.append(None)
+                    dates = [dt for dt in dates if dt is not None]
+                    if not dates:
+                        _diag("聲活／鉑霖：無法由「幾日」與月份組出有效西曆日期。")
+                        continue
+                    start_date = start_date or min(dates)
+                    end_date = end_date or max(dates)
 
             if eff_days is None or eff_days <= 0:
                 _diag("有效檔期天數為 0，略過本分頁。")
@@ -800,7 +1119,12 @@ def parse_cueapp_excel(
             if fmt != "dongwu" and date_header_row is not None and date_start_col is not None:
                 try:
                     day_cols2 = []
-                    for j in range(date_start_col, min(df.shape[1], date_start_col + 80)):
+                    j_hi = (
+                        (date_grid_last_j + 1)
+                        if date_grid_last_j is not None
+                        else min(df.shape[1], date_start_col + 80)
+                    )
+                    for j in range(date_start_col, j_hi):
                         d = _parse_day_cell(df.iloc[date_header_row, j])
                         if d is None:
                             if day_cols2:
@@ -843,7 +1167,13 @@ def parse_cueapp_excel(
                         f"逐日日期改由執行期間連續展開（{eff_days} 天）；若與表頭「幾日」不完全對齊，請以表頭為準人工核對。"
                     )
 
-            if fmt in ("bolin", "shenghuo") and schedule_day_row is not None and date_start_col is not None and sec_col is not None:
+            if (
+                fmt in ("bolin", "shenghuo")
+                and schedule_day_row is not None
+                and date_start_col is not None
+                and sec_col is not None
+                and not bolin_data_start_locked
+            ):
                 data_start_row = _find_ch_schedule_data_start_row(
                     df, schedule_day_row, date_start_col, eff_days, diagnostics_out
                 )
@@ -1192,10 +1522,12 @@ def parse_cueapp_excel_with_report(file_content: bytes) -> dict:
 
     parse_diagnostics: list[str] = []
     excel_layout_sections: list[str] = []
+    structural_sections: list[str] = []
     ad_units = parse_cueapp_excel(
         file_content,
         diagnostics_out=parse_diagnostics,
         layout_sections_out=excel_layout_sections,
+        structural_reports_out=structural_sections,
     )
 
     sheets_report: list[dict] = []
@@ -1288,6 +1620,7 @@ def parse_cueapp_excel_with_report(file_content: bytes) -> dict:
         "sheets": sheets_report,
         "parse_diagnostics": parse_diagnostics,
         "excel_layout_sections": excel_layout_sections,
+        "cue_structural_reports": structural_sections,
         "issues": issues,
         "warnings": warnings,
     }
@@ -1471,6 +1804,7 @@ def parse_cue_excel_for_table1(
     order_info=None,
     cue_parse_diagnostics: list | None = None,
     cue_layout_sections: list | None = None,
+    cue_structural_reports: list | None = None,
 ):
     result = []
     try:
@@ -1478,6 +1812,7 @@ def parse_cue_excel_for_table1(
             file_content,
             diagnostics_out=cue_parse_diagnostics,
             layout_sections_out=cue_layout_sections,
+            structural_reports_out=cue_structural_reports,
         )
         if result:
             if order_info:
