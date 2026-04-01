@@ -29,6 +29,21 @@ def render_sidebar_admin(
     sync_sheets_if_enabled: Callable[..., object],
 ) -> None:
     st.sidebar.markdown("---")
+    if "_reset_progress_lines" not in st.session_state:
+        st.session_state["_reset_progress_lines"] = []
+    if "_reset_progress_value" not in st.session_state:
+        st.session_state["_reset_progress_value"] = 0.0
+    if "_reset_last_status" not in st.session_state:
+        st.session_state["_reset_last_status"] = ""
+
+    if st.session_state["_reset_progress_lines"]:
+        _render_reset_progress(
+            st.session_state["_reset_progress_lines"],
+            float(st.session_state["_reset_progress_value"]),
+        )
+        if st.session_state["_reset_last_status"]:
+            st.sidebar.caption(st.session_state["_reset_last_status"])
+
     with st.sidebar.expander("🔎 Google Sheet 連線診斷", expanded=False):
         try:
             from sheets_backend import (
@@ -63,6 +78,9 @@ def render_sidebar_admin(
         try:
             progress_lines: list[str] = ["開始重置流程"]
             _render_reset_progress(progress_lines, 0.05)
+            st.session_state["_reset_progress_lines"] = progress_lines[:]
+            st.session_state["_reset_progress_value"] = 0.05
+            st.session_state["_reset_last_status"] = "執行中"
             # 改為直接清空資料表，避免依賴 db 檔路徑導致「看似重置、實際未清空」。
             init_db()
             conn = get_db_connection()
@@ -80,6 +98,8 @@ def render_sidebar_admin(
                 conn.close()
             progress_lines.append("本地資料庫已清空（Users 保留）")
             _render_reset_progress(progress_lines, 0.35)
+            st.session_state["_reset_progress_lines"] = progress_lines[:]
+            st.session_state["_reset_progress_value"] = 0.35
 
             st.sidebar.success("✅ 已清空資料庫資料（Users 保留）")
 
@@ -97,23 +117,26 @@ def render_sidebar_admin(
             _render_reset_progress(progress_lines, 0.5)
             direct_clear_errs, step_reports = clear_business_tables_in_sheets_with_report(
                 keep_users=True,
-                verify_after_clear=False,
+                verify_after_clear=True,
             )
             progress_lines.extend(step_reports)
             _render_reset_progress(progress_lines, 0.9)
+            st.session_state["_reset_progress_lines"] = progress_lines[:]
+            st.session_state["_reset_progress_value"] = 0.9
             if direct_clear_errs:
                 st.sidebar.error("Google Sheet 直接清空失敗：" + "; ".join(direct_clear_errs[:5]))
+                st.session_state["_reset_last_status"] = "失敗"
                 return
 
             # 直接清空成功即視為完成；避免再做第二輪同步造成 API 配額壓力
             progress_lines.append("全部完成")
             _render_reset_progress(progress_lines, 1.0)
+            st.session_state["_reset_progress_lines"] = progress_lines[:]
+            st.session_state["_reset_progress_value"] = 1.0
+            st.session_state["_reset_last_status"] = "成功"
             st.sidebar.success("✅ Google Sheet 已清空（Users 保留）")
-            # 避免 app 重新啟動時又立刻從 Sheet 把資料灌回 DB
-            st.session_state["_sheets_restored"] = True
-            time.sleep(1)
-            st.rerun()
         except Exception as e:
+            st.session_state["_reset_last_status"] = "例外"
             st.sidebar.error(f"❌ 刪除失敗: {e}")
 
     st.sidebar.markdown("---")

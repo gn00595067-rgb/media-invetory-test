@@ -918,8 +918,9 @@ def clear_business_tables_in_sheets_with_report(
             errors.append(msg)
             reports.append(f"例外：{msg}")
 
+    # 預設做輕量驗證：只讀各表第 2 列（資料首列）是否為空，避免高配額讀取。
     if verify_after_clear:
-        reports.append("開始回讀驗證")
+        reports.append("開始回讀驗證（檢查第2列）")
         try:
             sh = _client()
             if not sh:
@@ -927,14 +928,14 @@ def clear_business_tables_in_sheets_with_report(
                 errors.append(msg)
                 reports.append(msg)
             else:
-                for name, _, _ in table_jobs:
+                for name, cols, _ in table_jobs:
                     try:
                         ws = sh.worksheet(name)
-                        values = ws.get_all_values() or []
-                        body_rows = values[1:] if len(values) > 1 else []
-                        has_non_empty = any(any(str(cell).strip() for cell in row) for row in body_rows)
+                        end_col = _col_to_a1(max(1, len(cols)))
+                        row2 = ws.get(f"A2:{end_col}2") or []
+                        has_non_empty = any(any(str(cell).strip() for cell in row) for row in row2)
                         if has_non_empty:
-                            msg = f"{name}: 驗證未通過（仍有資料列）"
+                            msg = f"{name}: 驗證未通過（第2列仍有資料）"
                             errors.append(msg)
                             reports.append(msg)
                         else:
