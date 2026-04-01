@@ -470,8 +470,11 @@ def _ragic_entry_collect_order_rows(
                 message=f"下載失敗：{derr}",
             )
             continue
+        cue_parse_diag: list[str] = []
         try:
-            cue_units = parse_cue_excel_for_table1(content, order_info=order_info)
+            cue_units = parse_cue_excel_for_table1(
+                content, order_info=order_info, cue_parse_diagnostics=cue_parse_diag
+            )
         except Exception as e:
             cue_units = []
             flog["parse_err"] = str(e)
@@ -491,9 +494,16 @@ def _ragic_entry_collect_order_rows(
             continue
 
         flog["n_units"] = len(cue_units)
+        flog["cue_parse_diagnostics"] = cue_parse_diag
         if not cue_units:
             state["file_logs"].append(flog)
             state["issues"].append(f"檔案#{file_i} 解析不到可用 ad_unit")
+            if cue_parse_diag:
+                cap = 15
+                tail = f" …（共 {len(cue_parse_diag)} 條）" if len(cue_parse_diag) > cap else ""
+                state["issues"].append(
+                    f"檔案#{file_i} 解析診斷：" + "；".join(cue_parse_diag[:cap]) + tail
+                )
             _log_ragic_import(
                 get_db_connection=get_db_connection,
                 batch_id=batch_id,

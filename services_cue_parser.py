@@ -6,6 +6,9 @@ from datetime import date, datetime
 
 import pandas as pd
 
+# 播出時段樣式 07:00-23:00（欄位驗證／列推斷共用）
+_TIME_RANGE_RE = re.compile(r"\d{1,2}\s*:\s*\d{2}\s*[-~－至到]\s*\d{1,2}\s*:\s*\d{2}")
+
 
 # ================= Cueapp Excel 專用解析（東吳／聲活／鉑霖三種格式）=================
 def _parse_cueapp_period_dongwu(row_b5_value):
@@ -173,6 +176,232 @@ def _find_cueapp_sec_col(df: pd.DataFrame, header_row_idx: int, row_span: int = 
     return None
 
 
+_WEEKDAYS_CN = frozenset("一二三四五六日")
+
+
+def _cell_is_weekday_cn(v) -> bool:
+    s = str(v).strip() if v is not None else ""
+    return len(s) == 1 and s in _WEEKDAYS_CN
+
+
+def _row_month_hint_from_text(df: pd.DataFrame, r: int, max_col: int = 40) -> int | None:
+    """從單列文字中找「N月」作為月份提示。"""
+    if r < 0 or r >= len(df):
+        return None
+    for j in range(min(max_col, df.shape[1])):
+        s = str(df.iloc[r, j]).replace("\n", " ").strip()
+        m = re.search(r"(\d{1,2})\s*月", s)
+        if m:
+            mm = int(m.group(1))
+            if 1 <= mm <= 12:
+                return mm
+    return None
+
+
+def _infer_month_neighborhood(df: pd.DataFrame, anchor_row: int) -> int | None:
+    """錨列上下數列內找「N月」等月份提示（不依賴單一欄位）。"""
+    for dr in range(-4, 3):
+        ri = anchor_row + dr
+        mm = _row_month_hint_from_text(df, ri)
+        if mm is not None:
+            return mm
+    return None
+
+
+def _count_numeric_day_headers_in_row(df: pd.DataFrame, r: int, j0: int, j1: int) -> int:
+    if r < 0 or r >= len(df):
+        return 0
+    n = 0
+    for j in range(j0, min(j1, df.shape[1])):
+        if _parse_cueapp_day_header_cell(df.iloc[r, j]) is not None:
+            n += 1
+    return n
+
+
+def _pick_numeric_day_header_row(
+    df: pd.DataFrame,
+    anchor_row: int,
+    date_start_col: int,
+    diagnostics: list | None,
+    min_days: int = 3,
+) -> tuple[int, list[str]]:
+    """
+    在錨列上下多列中，選「日期數字（1–31）」最密集之列，避免把「4月」列或週幾列當成日期錨點。
+    """
+    notes: list[str] = []
+    j1 = min(df.shape[1], date_start_col + 80)
+    best_r, best_n = anchor_row, -1
+    for r in range(max(0, anchor_row - 3), min(len(df), anchor_row + 4)):
+        cnt = _count_numeric_day_headers_in_row(df, r, date_start_col, j1)
+        if cnt > best_n:
+            best_n, best_r = cnt, r
+    if best_n < min_days:
+        msg = (
+            f"日期表頭：錨列上下未找到足夠的「幾日」數字欄（最多 {best_n} 欄，需要至少 {min_days}），"
+            f"可能為合併異常或日期與週幾列位置與預期不同。"
+        )
+        notes.append(msg)
+        if diagnostics is not None:
+            diagnostics.append(msg)
+        return anchor_row, notes
+    if best_r != anchor_row:
+        msg = f"日期表頭：以第 {best_r + 1} 列（0-based={best_r}）為「幾日」數字列，而非原錨列 {anchor_row + 1}。"
+        notes.append(msg)
+        if diagnostics is not None:
+            diagnostics.append(msg)
+    return best_r, notes
+
+
+def _row_looks_like_weekday_subheader(df: pd.DataFrame, r: int, date_start_col: int, n_slots: int) -> bool:
+    """整段日期欄多為週幾單字 → 週幾子表頭列。"""
+    if r < 0 or r >= len(df):
+        return False
+    row = df.iloc[r]
+    wd, filled = 0, 0
+    for c in range(date_start_col, min(len(row), date_start_col + n_slots)):
+        s = str(row.iloc[c]).strip()
+        if not s or s.lower() == "nan":
+            continue
+        filled += 1
+        if _cell_is_weekday_cn(row.iloc[c]):
+            wd += 1
+    return filled >= 3 and wd >= filled * 0.55
+
+
+def _row_looks_like_month_banner_row(df: pd.DataFrame, r: int, date_start_col: int, n_slots: int) -> bool:
+    """日期區僅見「N月」類、幾乎無數字日期 → 月份列。"""
+    if r < 0 or r >= len(df):
+        return False
+    row = df.iloc[r]
+    month_cells, num_days = 0, 0
+    for c in range(date_start_col, min(len(row), date_start_col + n_slots)):
+        s = str(row.iloc[c]).replace("\n", " ").strip()
+        if not s or s.lower() == "nan":
+            continue
+        if re.search(r"\d{1,2}\s*月", s):
+            month_cells += 1
+        if _parse_cueapp_day_header_cell(df.iloc[r, c]) is not None:
+            num_days += 1
+    return month_cells >= 1 and num_days <= 1
+
+
+def _find_ch_schedule_data_start_row(
+    df: pd.DataFrame,
+    numeric_day_row: int,
+    date_start_col: int,
+    n_date_cols: int,
+    diagnostics: list | None,
+) -> int:
+    """
+    自數字日期列下一列起掃描：略過週幾列、略過單純「N月」列，再找第一列像資料列者。
+    仍找不到則回退 numeric_day_row+2（舊版慣例）。
+    """
+    r = numeric_day_row + 1
+    limit = min(numeric_day_row + 8, len(df))
+    skipped: list[str] = []
+    while r < limit:
+        if _row_looks_like_month_banner_row(df, r, date_start_col, n_date_cols):
+            skipped.append(f"列{r+1}視為月份列")
+            r += 1
+            continue
+        if _row_looks_like_weekday_subheader(df, r, date_start_col, n_date_cols):
+            skipped.append(f"列{r+1}視為週幾子表頭")
+            r += 1
+            continue
+        row = df.iloc[r]
+        spot_sum = sum(
+            _safe_spots(row.iloc[c])
+            for c in range(date_start_col, min(len(row), date_start_col + n_date_cols))
+        )
+        if spot_sum > 0:
+            msg = f"資料起始列：第 {r + 1} 列（略過：{'; '.join(skipped) if skipped else '無'}）。"
+            if diagnostics is not None:
+                diagnostics.append(msg)
+            return r
+        r += 1
+    fallback = numeric_day_row + 2
+    msg = f"資料起始列：未在緊鄰列找到檔次數字，回退為第 {fallback + 1} 列（numeric_row+2）。略過：{'; '.join(skipped) if skipped else '無'}。"
+    if diagnostics is not None:
+        diagnostics.append(msg)
+    return min(fallback, len(df) - 1) if len(df) > 0 else 0
+
+
+def _validate_left_block_against_samples(
+    df: pd.DataFrame,
+    sec_col: int,
+    date_start_col: int,
+    data_start_row: int,
+    n_date_cols: int,
+    diagnostics: list | None,
+    max_samples: int = 10,
+) -> None:
+    """
+    在表頭下方抽樣含檔次之列，比對左側欄位是否像「頻道／地區／店數／時段／秒數」語意；差異大則寫入診斷，不中止解析。
+    """
+    if diagnostics is None:
+        return
+    region_kw = ("雲嘉南", "高屏", "北北基", "桃竹苗", "中彰投", "宜花東", "全省", "高高屏")
+    samples: list[int] = []
+    for r in range(data_start_row, min(data_start_row + 40, len(df))):
+        row = df.iloc[r]
+        if str(row.iloc[date_start_col]).strip() in _WEEKDAYS_CN if date_start_col < len(row) else False:
+            continue
+        spots = sum(
+            _safe_spots(row.iloc[c])
+            for c in range(date_start_col, min(len(row), date_start_col + n_date_cols))
+        )
+        if spots <= 0:
+            continue
+        tsec = str(row.iloc[sec_col]).replace("\n", " ") if sec_col < len(row) else ""
+        if "total" in tsec.lower():
+            continue
+        samples.append(r)
+        if len(samples) >= max_samples:
+            break
+    if not samples:
+        diagnostics.append("欄位驗證：表頭下方短區間內未取到含檔次之資料列樣本，無法驗證左側欄位（仍繼續解析）。")
+        return
+    reg_hit = 0
+    time_hit = 0
+    sec_hit = 0
+    ch_hit = 0
+    for r in samples:
+        row = df.iloc[r]
+        if df.shape[1] > 1:
+            b = str(row.iloc[1]).strip()
+            if any(k in b for k in region_kw) or (len(b) <= 8 and any(x in b for x in ("區", "屏", "基", "南", "北", "中"))):
+                reg_hit += 1
+        rt = row.fillna("").astype(str).str.cat(sep=" ")[:200]
+        if _TIME_RANGE_RE.search(rt) or ("07:" in rt and "23:" in rt):
+            time_hit += 1
+        if sec_col < len(row):
+            sc = str(row.iloc[sec_col]).replace("\n", " ")
+            if re.search(r"\d+\s*秒", sc) or "秒" in sc:
+                sec_hit += 1
+        if df.shape[1] > 0:
+            a = str(row.iloc[0]).strip()
+            if a and a.lower() != "nan" and len(a) >= 2:
+                if any(k in a for k in ("全家", "廣播", "新鮮", "家樂福", "FM", "店鋪")):
+                    ch_hit += 1
+    n = len(samples)
+    if reg_hit < max(1, int(n * 0.25)):
+        diagnostics.append(
+            f"欄位驗證（警告）：播出地區欄樣本命中率 {reg_hit}/{n} 偏低，若地區錯請檢查是否多插欄或合併格位移。"
+        )
+    if time_hit < max(1, int(n * 0.15)):
+        diagnostics.append(
+            f"欄位驗證（提示）：播出時段格式樣本命中率 {time_hit}/{n}，若表無時段欄可忽略。"
+        )
+    if sec_hit < max(1, int(n * 0.25)):
+        diagnostics.append(
+            f"欄位驗證（警告）：秒數欄（索引 {sec_col}）樣本命中率 {sec_hit}/{n}，若秒數錯請檢查秒數欄是否位移。"
+        )
+    if ch_hit < max(1, int(n * 0.2)):
+        diagnostics.append(
+            f"欄位驗證（提示）：頻道欄樣本命中率 {ch_hit}/{n}（合併儲存格下列常空白，可能偏低屬正常）。"
+        )
+
+
 def _safe_spots(val):
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return 0
@@ -198,7 +427,7 @@ def _extract_seconds_from_cell(val):
     return 0
 
 
-def parse_cueapp_excel(file_content):
+def parse_cueapp_excel(file_content, diagnostics_out: list | None = None):
     result = []
     try:
         excel_file = io.BytesIO(file_content)
@@ -208,9 +437,14 @@ def parse_cueapp_excel(file_content):
 
     for sheet_name in xls.sheet_names:
         try:
+            def _diag(msg: str) -> None:
+                if diagnostics_out is not None:
+                    diagnostics_out.append(f"[{sheet_name}] {msg}")
+
             excel_file.seek(0)
             df = pd.read_excel(excel_file, sheet_name=sheet_name, header=None, engine="openpyxl")
             if df.empty or len(df) < 9:
+                _diag("略過：工作表為空或列數 < 9。")
                 continue
             top_block = _cueapp_top_block_text(df, max_rows=22)
             row0_text = _row_text_df(df, 0)
@@ -236,12 +470,16 @@ def parse_cueapp_excel(file_content):
                     if start and end:
                         fmt = "dongwu"
                 if fmt is None:
+                    _diag("略過：無法判定為東吳／聲活／鉑霖（頂部關鍵字與工作表名皆不符）。")
                     continue
 
             start_date, end_date = None, None
             date_start_col = None
             eff_days = None
             header_row_idx = None
+            sec_col: int | None = None
+            schedule_day_row: int | None = None
+            data_start_row: int | None = None
 
             def _parse_day_cell(v):
                 v = _cell_val(v)
@@ -312,6 +550,8 @@ def parse_cueapp_excel(file_content):
                 if start_date and end_date:
                     date_start_col = 7
                     header_row_idx = 6
+                    schedule_day_row = header_row_idx
+                    data_start_row = header_row_idx + 2
                     for c in range(df.shape[1] - 1, date_start_col - 1, -1):
                         try:
                             val = str(df.iloc[header_row_idx, c]).strip() + str(df.iloc[header_row_idx + 1, c]).strip()
@@ -325,9 +565,11 @@ def parse_cueapp_excel(file_content):
                 else:
                     header_row_idx = _find_cueapp_schedule_header_row(df)
                     if header_row_idx is None:
+                        _diag("東吳：找不到排程表頭列。")
                         continue
                     sec_col = _find_cueapp_sec_col(df, header_row_idx)
                     if sec_col is None:
+                        _diag("東吳：找不到秒數／Size 欄。")
                         continue
                     hdr_join = _row_text_df(df, header_row_idx)
                     # 東吳英文表固定 A~G（0~6）為 Station…Package-cost，日期自第 8 欄（index 7）起
@@ -344,8 +586,11 @@ def parse_cueapp_excel(file_content):
                             continue
                         day_cols.append((j, d))
                     if not day_cols:
+                        _diag("東吳：表頭右側未找到連續「幾日」數字欄。")
                         continue
                     eff_days = len(day_cols)
+                    schedule_day_row = header_row_idx
+                    data_start_row = header_row_idx + 2
                     year = _infer_year_from_df(df) or datetime.now().year
                     months = []
                     last_day = None
@@ -366,6 +611,7 @@ def parse_cueapp_excel(file_content):
                         except Exception:
                             pass
                     if not dates2:
+                        _diag("東吳：無法由表頭日期組出有效西曆日期。")
                         continue
                     start_date = min(dates2)
                     end_date = max(dates2)
@@ -373,20 +619,35 @@ def parse_cueapp_excel(file_content):
                 start_date, end_date = _parse_cueapp_period_shenghuo_bolin(df)
                 header_row_idx = _find_cueapp_schedule_header_row(df)
                 if header_row_idx is None:
+                    _diag("聲活／鉑霖：找不到排程表頭列（頻道、秒數線索、播出地區等）。")
                     continue
                 sec_col = _find_cueapp_sec_col(df, header_row_idx)
                 if sec_col is None:
+                    _diag("聲活／鉑霖：找不到秒數／Size 欄（含 15秒廣告 等形式）。")
                     continue
                 date_start_col = sec_col + 1
+                schedule_day_row, pick_notes = _pick_numeric_day_header_row(
+                    df, header_row_idx, date_start_col, None
+                )
+                for note in pick_notes:
+                    _diag(note)
+                flex_month = _infer_month_neighborhood(df, schedule_day_row)
+                if flex_month is not None:
+                    _diag(f"月份提示：表頭鄰近掃到「{flex_month} 月」（與執行期間併用於拼日期）。")
+
                 day_cols = []
                 for j in range(date_start_col, min(df.shape[1], date_start_col + 80)):
-                    d = _parse_day_cell(df.iloc[header_row_idx, j])
+                    d = _parse_day_cell(df.iloc[schedule_day_row, j])
                     if d is None:
                         if day_cols:
                             break
                         continue
                     day_cols.append((j, d))
                 if not day_cols:
+                    _diag(
+                        f"在「幾日」數字列（第 {schedule_day_row + 1} 列）右側未找到連續日期欄（1–31）；"
+                        "常見原因：日期與週幾分行、上方另有「N月」列、或合併格導致空白。"
+                    )
                     continue
                 eff_days = len(day_cols)
 
@@ -396,9 +657,11 @@ def parse_cueapp_excel(file_content):
                 months = []
                 last_day = None
                 last_month = None
-                base_month = start_date.month if start_date else None
+                base_month = (start_date.month if start_date else None) or flex_month
+                if base_month is None:
+                    _diag("未由執行期間或「N月」列取得月份，將依欄位上方逐欄推斷或沿用上一欄月份；跨月請人工核對。")
                 for j, d in day_cols:
-                    mm = _infer_month_for_col(df, header_row_idx, j) or base_month
+                    mm = _infer_month_for_col(df, schedule_day_row, j) or base_month
                     if mm is None:
                         if last_month is None:
                             mm = 1
@@ -418,18 +681,21 @@ def parse_cueapp_excel(file_content):
                         dates.append(None)
                 dates = [dt for dt in dates if dt is not None]
                 if not dates:
+                    _diag("聲活／鉑霖：無法由「幾日」與月份組出有效西曆日期。")
                     continue
                 start_date = start_date or min(dates)
                 end_date = end_date or max(dates)
 
             if eff_days is None or eff_days <= 0:
+                _diag("有效檔期天數為 0，略過本分頁。")
                 continue
             dates_str = None
-            if fmt != "dongwu" and header_row_idx is not None and date_start_col is not None:
+            date_header_row = schedule_day_row if schedule_day_row is not None else header_row_idx
+            if fmt != "dongwu" and date_header_row is not None and date_start_col is not None:
                 try:
                     day_cols2 = []
                     for j in range(date_start_col, min(df.shape[1], date_start_col + 80)):
-                        d = _parse_day_cell(df.iloc[header_row_idx, j])
+                        d = _parse_day_cell(df.iloc[date_header_row, j])
                         if d is None:
                             if day_cols2:
                                 break
@@ -441,7 +707,7 @@ def parse_cueapp_excel(file_content):
                         last_day2 = None
                         last_month2 = start_date.month if start_date else None
                         for j, d in day_cols2:
-                            mm = _infer_month_for_col(df, header_row_idx, j) or last_month2
+                            mm = _infer_month_for_col(df, date_header_row, j) or last_month2
                             if mm is None:
                                 mm = 1
                             if last_day2 is not None and d < last_day2 and (mm == last_month2):
@@ -458,16 +724,29 @@ def parse_cueapp_excel(file_content):
                         if dates2:
                             dates_str = [dt.strftime("%Y-%m-%d") for dt in dates2]
                             eff_days = len(dates_str)
-                except Exception:
+                except Exception as e:
                     dates_str = None
+                    _diag(f"重建逐日日期字串時發生例外（已改以執行期間填補）：{e}")
             if not dates_str:
                 date_list = pd.date_range(start_date, end_date, freq="D")
                 if len(date_list) != eff_days:
                     date_list = date_list[:eff_days]
                 dates_str = [d.strftime("%Y-%m-%d") for d in date_list]
+                if fmt in ("bolin", "shenghuo"):
+                    _diag(
+                        f"逐日日期改由執行期間連續展開（{eff_days} 天）；若與表頭「幾日」不完全對齊，請以表頭為準人工核對。"
+                    )
 
-            # 與 Excel Renderer 一致：頻道／Station 與「日期列」佔兩列合併列，資料自表頭第一列 +2 列開始
-            data_start_row = header_row_idx + 2
+            if fmt in ("bolin", "shenghuo") and schedule_day_row is not None and date_start_col is not None and sec_col is not None:
+                data_start_row = _find_ch_schedule_data_start_row(
+                    df, schedule_day_row, date_start_col, eff_days, diagnostics_out
+                )
+                _validate_left_block_against_samples(
+                    df, sec_col, date_start_col, data_start_row, eff_days, diagnostics_out
+                )
+            elif data_start_row is None:
+                data_start_row = (header_row_idx if header_row_idx is not None else 0) + 2
+
             platform_info = _extract_platform_from_sheet(df, sheet_name)
             seconds_info = _extract_seconds_from_sheet(df, sheet_name)
             default_seconds = seconds_info.get("seconds", 0)
@@ -484,7 +763,8 @@ def parse_cueapp_excel(file_content):
                                 continue
                     except Exception:
                         pass
-                    e_val = row.iloc[4] if len(row) > 4 else None
+                    total_chk_col = sec_col if fmt in ("bolin", "shenghuo") and sec_col is not None else 4
+                    e_val = row.iloc[total_chk_col] if len(row) > total_chk_col else None
                     e_str = str(e_val).strip() if e_val is not None else ""
                     if "Total" in e_str or "total" in e_str or e_str == "Total":
                         break
@@ -683,8 +963,6 @@ def map_cue_header_fields(df: pd.DataFrame, header_anchor_row: int, row_span: in
     return out
 
 
-_TIME_RANGE_RE = re.compile(r"\d{1,2}\s*:\s*\d{2}\s*[-~－至到]\s*\d{1,2}\s*:\s*\d{2}")
-
 _REGION_TOKENS = frozenset(
     ["全省", "北北基", "桃竹苗", "中彰投", "雲嘉南", "高高屏", "高屏", "宜花東", "北區", "中區", "南區"]
 )
@@ -806,7 +1084,8 @@ def parse_cueapp_excel_with_report(file_content: bytes) -> dict:
         workbook_scan = {"ok": False, "error": str(e)}
         warnings.append(f"快速掃描例外：{e}")
 
-    ad_units = parse_cueapp_excel(file_content)
+    parse_diagnostics: list[str] = []
+    ad_units = parse_cueapp_excel(file_content, diagnostics_out=parse_diagnostics)
 
     sheets_report: list[dict] = []
     try:
@@ -896,6 +1175,7 @@ def parse_cueapp_excel_with_report(file_content: bytes) -> dict:
         "ad_unit_count": len(ad_units),
         "workbook_scan": workbook_scan,
         "sheets": sheets_report,
+        "parse_diagnostics": parse_diagnostics,
         "issues": issues,
         "warnings": warnings,
     }
@@ -1074,10 +1354,10 @@ def parse_excel_daily_ads(file_content, target_spots=None):
         return result
 
 
-def parse_cue_excel_for_table1(file_content, order_info=None):
+def parse_cue_excel_for_table1(file_content, order_info=None, cue_parse_diagnostics: list | None = None):
     result = []
     try:
-        result = parse_cueapp_excel(file_content)
+        result = parse_cueapp_excel(file_content, diagnostics_out=cue_parse_diagnostics)
         if result:
             if order_info:
                 for ad_unit in result:
