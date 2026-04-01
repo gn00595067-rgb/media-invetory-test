@@ -414,6 +414,8 @@ def parse_cueapp_excel(file_content):
             platform_info = _extract_platform_from_sheet(df, sheet_name)
             seconds_info = _extract_seconds_from_sheet(df, sheet_name)
             default_seconds = seconds_info.get("seconds", 0)
+            # 鉑霖／聲活：A 欄「頻道」直向合併，pandas 僅第一列有字、下列為 NaN，需沿用上一列頻道名才能讀到第二區（如高屏）
+            last_merged_channel = ""
 
             for r in range(data_start_row, min(data_start_row + 200, len(df))):
                 row = df.iloc[r]
@@ -429,8 +431,17 @@ def parse_cueapp_excel(file_content):
                     e_str = str(e_val).strip() if e_val is not None else ""
                     if "Total" in e_str or "total" in e_str or e_str == "Total":
                         break
-                    first_cell = str(row.iloc[0]).strip() if len(row) > 0 else ""
-                    if not first_cell or first_cell == "nan":
+                    raw_a = row.iloc[0] if len(row) > 0 else None
+                    first_cell = (
+                        str(raw_a).strip()
+                        if raw_a is not None and not (isinstance(raw_a, float) and pd.isna(raw_a)) and str(raw_a).strip().lower() != "nan"
+                        else ""
+                    )
+                    if first_cell:
+                        last_merged_channel = first_cell
+                    elif fmt in ("bolin", "shenghuo") and last_merged_channel:
+                        first_cell = last_merged_channel
+                    if not first_cell:
                         continue
                     region_cell = row.iloc[1] if len(row) > 1 else ""
                     region = str(region_cell).strip() if region_cell is not None and str(region_cell) != "nan" else platform_info.get("region", "全省")
