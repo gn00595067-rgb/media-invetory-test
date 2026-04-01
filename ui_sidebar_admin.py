@@ -21,6 +21,42 @@ def render_sidebar_admin(
     sync_sheets_if_enabled: Callable[..., object],
 ) -> None:
     st.sidebar.markdown("---")
+    with st.sidebar.expander("☁️ Google Sheet 資料庫（簡易）", expanded=False):
+        st.caption("只保留兩個核心動作：寫入（覆蓋 Sheet）與讀取（覆蓋本地 DB）。")
+        try:
+            from sheets_backend import (
+                is_sheets_enabled,
+                get_sheets_url,
+                sync_db_to_sheets,
+                load_all_from_sheets_into_db,
+            )
+
+            if not is_sheets_enabled():
+                st.warning("Google Sheet 未啟用或設定不完整。")
+            else:
+                sheets_url = get_sheets_url()
+                if sheets_url:
+                    st.link_button("🔗 開啟 Google Sheet", sheets_url, use_container_width=True)
+
+                if st.button("⬆️ 存入 Google Sheet（完全覆蓋）", key="btn_export_db_to_sheets"):
+                    with st.spinner("正在寫入 Google Sheet..."):
+                        errs = sync_db_to_sheets(get_db_connection, skip_if_unchanged=False)
+                    if errs:
+                        st.error("寫入失敗：" + "; ".join(errs[:5]))
+                    else:
+                        st.success("已將目前程式資料完整寫入 Google Sheet。")
+
+                if st.button("⬇️ 讀取 Google Sheet（覆蓋本地資料）", key="btn_import_sheets_to_db"):
+                    with st.spinner("正在從 Google Sheet 載入資料..."):
+                        errs = load_all_from_sheets_into_db(get_db_connection, init_db)
+                    if errs:
+                        st.error("讀取失敗：" + "; ".join(errs[:5]))
+                    else:
+                        st.success("已用 Google Sheet 資料覆蓋本地資料。")
+                        st.rerun()
+        except Exception as e:
+            st.error(f"Google Sheet 功能載入失敗：{e}")
+
     if st.sidebar.button("🧨 重置資料庫（清空資料，保留 Users）", help="⚠️ 警告：會清空主要業務資料，保留帳號權限"):
         try:
             init_db()
