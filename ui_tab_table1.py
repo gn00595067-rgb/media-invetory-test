@@ -302,7 +302,13 @@ def render_table1_tab(
 
                 seg_id_selected_list = []
                 if "選取" in edited_df.columns:
-                    seg_id_selected_list = edited_df.index[edited_df["選取"] == True].astype(str).tolist()
+                    sel_series = edited_df["選取"]
+                    # st.data_editor 在不同版本/型別下可能回傳 bool、0/1 或 "true"/"false"
+                    sel_mask = (
+                        sel_series.astype(str).str.strip().str.lower().isin(["true", "1", "yes", "y"])
+                        | (sel_series == True)
+                    )
+                    seg_id_selected_list = edited_df.index[sel_mask].astype(str).tolist()
                 st.session_state["seg_selected_ids"] = sorted(set(seg_id_selected_list))
                 st.caption(f"本次選取：{len(seg_id_selected_list)} 筆")
 
