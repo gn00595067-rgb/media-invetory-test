@@ -23,6 +23,7 @@ def render_sidebar_admin(
     st.sidebar.markdown("---")
     with st.sidebar.expander("☁️ Google Sheet 資料庫（簡易）", expanded=False):
         st.caption("只保留兩個核心動作：寫入（覆蓋 Sheet）與讀取（覆蓋本地 DB）。")
+        sync_business_only = st.checkbox("僅同步業務資料（不含 Users）", value=True, key="gs_sync_business_only")
         try:
             from sheets_backend import (
                 is_sheets_enabled,
@@ -40,19 +41,53 @@ def render_sidebar_admin(
 
                 if st.button("⬆️ 存入 Google Sheet（完全覆蓋）", key="btn_export_db_to_sheets"):
                     with st.spinner("正在寫入 Google Sheet..."):
-                        errs = sync_db_to_sheets(get_db_connection, skip_if_unchanged=False)
+                        only_tables = ["Orders", "Segments", "PlatformSettings", "Capacity", "Purchase"] if sync_business_only else None
+                        errs = sync_db_to_sheets(
+                            get_db_connection,
+                            only_tables=only_tables,
+                            skip_if_unchanged=False,
+                        )
                     if errs:
                         st.error("寫入失敗：" + "; ".join(errs[:5]))
                     else:
-                        st.success("已將目前程式資料完整寫入 Google Sheet。")
+                        if sync_business_only:
+                            st.success("已將業務資料寫入 Google Sheet（Users 未同步）。")
+                        else:
+                            st.success("已將目前程式資料完整寫入 Google Sheet。")
 
                 if st.button("⬇️ 讀取 Google Sheet（覆蓋本地資料）", key="btn_import_sheets_to_db"):
+                    users_backup_df = pd.DataFrame()
+                    if sync_business_only:
+                        try:
+                            conn_u = get_db_connection()
+                            users_backup_df = pd.read_sql("SELECT id, username, password_hash, role, created_at FROM users", conn_u)
+                            conn_u.close()
+                        except Exception:
+                            users_backup_df = pd.DataFrame()
                     with st.spinner("正在從 Google Sheet 載入資料..."):
                         errs = load_all_from_sheets_into_db(get_db_connection, init_db)
+                    if sync_business_only:
+                        # 還原 users：保留讀取前本地 users（避免被 Sheet 覆蓋）
+                        if not users_backup_df.empty:
+                            try:
+                                conn_w = get_db_connection()
+                                conn_w.execute("DELETE FROM users")
+                                for _, r in users_backup_df.iterrows():
+                                    conn_w.execute(
+                                        "INSERT OR REPLACE INTO users (id, username, password_hash, role, created_at) VALUES (?,?,?,?,?)",
+                                        (r.get("id"), r.get("username"), r.get("password_hash"), r.get("role"), r.get("created_at")),
+                                    )
+                                conn_w.commit()
+                                conn_w.close()
+                            except Exception as e:
+                                errs = (errs or []) + [f"Users 還原失敗: {e}"]
                     if errs:
                         st.error("讀取失敗：" + "; ".join(errs[:5]))
                     else:
-                        st.success("已用 Google Sheet 資料覆蓋本地資料。")
+                        if sync_business_only:
+                            st.success("已用 Google Sheet 覆蓋業務資料（Users 保留本地）。")
+                        else:
+                            st.success("已用 Google Sheet 資料覆蓋本地資料。")
                         st.rerun()
         except Exception as e:
             st.error(f"Google Sheet 功能載入失敗：{e}")
