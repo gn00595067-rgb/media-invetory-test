@@ -646,6 +646,13 @@ def render_ragic_test_tab(
     rid = entry.get("_ragicId", "")
     st.markdown("---")
     st.markdown(f"#### 📌 案子：_ragicId = {rid}")
+    # 讀檔時固定顯示秒數管理兩欄（即使空值也顯示）
+    sec_flag = _normalize_cell(_get_ragic_value_by_keys(entry, ragic_fields.get("秒數管理", ""), "秒數管理"))
+    sec_note = _normalize_cell(_get_ragic_value_by_keys(entry, ragic_fields.get("秒數管理(備註)", ""), "秒數管理(備註)"))
+    with st.expander("📝 秒數管理欄位（Ragic）", expanded=True):
+        st.text(f"秒數管理：{sec_flag}")
+        st.text("秒數管理(備註)：")
+        st.text(sec_note if sec_note else "（空白）")
 
     if import_ragic_single_entry_to_orders:
         st.caption("可將這筆單一 Ragic 案子匯入至 `orders` / `segments`（無法產生 segment 的列會被略過並寫入匯入紀錄）。")

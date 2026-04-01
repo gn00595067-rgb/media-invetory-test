@@ -369,6 +369,21 @@ def _compose_seconds_mgmt_remark(*, state: dict, batch_id: str, seconds_type_not
     return "\n".join(lines).strip()
 
 
+def _extract_segments_seconds_type_blocks(note_text: str) -> list[str]:
+    """保留既有備註中以【Segments 秒數用途更新紀錄】開頭的附加區塊。"""
+    txt = str(note_text or "")
+    marker = "【Segments 秒數用途更新紀錄】"
+    if marker not in txt:
+        return []
+    blocks: list[str] = []
+    parts = txt.split(marker)
+    for p in parts[1:]:
+        b = (marker + p).strip()
+        if b:
+            blocks.append(b)
+    return blocks
+
+
 def _push_seconds_mgmt_to_ragic(
     *,
     ref,
@@ -378,7 +393,7 @@ def _push_seconds_mgmt_to_ragic(
     batch_id: str,
     extra_seconds_notes: dict[str, list[str]] | None = None,
 ) -> str:
-    from ragic_client import post_update_entry_fields
+    from ragic_client import post_update_entry_fields, make_single_record_url, get_json
 
     fid_flag = ragic_fields.get("秒數管理")
     fid_note = ragic_fields.get("秒數管理(備註)")
@@ -392,6 +407,24 @@ def _push_seconds_mgmt_to_ragic(
         merged_notes = list(st.get("seconds_type_notes") or []) + list(extra.get(rid, []))
         flag = _seconds_mgmt_yes_no(st)
         remark = _compose_seconds_mgmt_remark(state=st, batch_id=batch_id, seconds_type_notes=merged_notes)
+        # 保留舊備註中人工更新過的「Segments 秒數用途更新紀錄」
+        old_note = ""
+        try:
+            one_url = make_single_record_url(ref, rid)
+            payload, err = get_json(one_url, api_key, timeout=60)
+            if not err and isinstance(payload, dict):
+                entry_obj = payload.get(str(rid)) if isinstance(payload.get(str(rid)), dict) else payload
+                if isinstance(entry_obj, dict):
+                    old_note = str(
+                        _ragic_get_field(entry_obj, "秒數管理(備註)", ragic_fields)
+                        or entry_obj.get(str(fid_note))
+                        or ""
+                    )
+        except Exception:
+            old_note = ""
+        preserved_blocks = _extract_segments_seconds_type_blocks(old_note)
+        if preserved_blocks:
+            remark = (remark + "\n\n" + "\n\n".join(preserved_blocks)).strip()
         remark = _truncate_seconds_remark(remark)
         ok, err = post_update_entry_fields(ref, rid, {str(fid_flag): flag, str(fid_note): remark}, api_key)
         if ok:
@@ -1337,4 +1370,77 @@ def get_ragic_import_logs_service(
         df = pd.DataFrame()
     conn.close()
     return df
+
+
+def append_seconds_type_notes_to_ragic_by_contract_service(
+    *,
+    ragic_url: str,
+    api_key: str,
+    ragic_fields: dict,
+    notes_by_contract: dict[str, list[str]],
+    max_fetch: int = 5000,
+) -> tuple[int, list[str]]:
+    """將 seconds_type 更新紀錄附加到對應合約的 Ragic「秒數管理(備註)」欄位。"""
+    msgs: list[str] = []
+    if not notes_by_contract:
+        return 0, msgs
+    if not ragic_url or not str(ragic_url).strip() or not api_key or not str(api_key).strip():
+        return 0, ["未提供 Ragic URL/API Key，略過回寫秒數管理備註。"]
+
+    from ragic_client import parse_sheet_url, make_listing_url, get_json, extract_entries, post_update_entry_fields
+
+    fid_note = ragic_fields.get("秒數管理(備註)")
+    if not fid_note:
+        return 0, ["ragic_fields 未設定「秒數管理(備註)」欄位 id，略過回寫。"]
+
+    contracts = {str(k).strip() for k in notes_by_contract.keys() if str(k).strip()}
+    if not contracts:
+        return 0, msgs
+
+    ref = parse_sheet_url(ragic_url)
+    all_entries: list[dict] = []
+    limit = 200
+    for offset in range(0, max_fetch, limit):
+        url = make_listing_url(ref, limit=limit, offset=offset, subtables0=False, fts="")
+        payload, err = get_json(url, api_key, timeout=60)
+        if err:
+            msgs.append(f"抓取 Ragic 清單失敗（offset={offset}）：{err}")
+            break
+        entries = extract_entries(payload)
+        if not entries:
+            break
+        all_entries.extend(entries)
+        if len(entries) < limit:
+            break
+
+    touched = 0
+    now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for entry in all_entries:
+        rid = str(entry.get("_ragicId") or "").strip()
+        if not rid:
+            continue
+        contract_id = str(_ragic_get_field(entry, "訂檔單號", ragic_fields) or "").strip()
+        if contract_id not in contracts:
+            continue
+        old_note = str(_ragic_get_field(entry, "秒數管理(備註)", ragic_fields) or "")
+        lines = [str(x) for x in (notes_by_contract.get(contract_id) or []) if str(x).strip()]
+        if not lines:
+            continue
+        append_block = "\n".join(
+            [
+                "【Segments 秒數用途更新紀錄】",
+                f"時間：{now_s}",
+                f"合約編號：{contract_id}",
+                *lines,
+            ]
+        )
+        new_note = ((old_note.rstrip() + "\n\n" + append_block) if old_note.strip() else append_block).strip()
+        new_note = _truncate_seconds_remark(new_note)
+        ok, err = post_update_entry_fields(ref, rid, {str(fid_note): new_note}, api_key)
+        if ok:
+            touched += 1
+            msgs.append(f"RagicId {rid} 已附加 seconds_type 更新紀錄。")
+        else:
+            msgs.append(f"RagicId {rid} 回寫失敗：{err}")
+    return touched, msgs
 

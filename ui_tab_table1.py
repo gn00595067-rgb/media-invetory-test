@@ -326,6 +326,58 @@ def render_table1_tab(
                         st.stop()
                     conn_upd.close()
 
+                    # 若選取列可對應到合約編號，附加回寫到 Ragic「秒數管理(備註)」以便後續追蹤。
+                    try:
+                        notes_by_contract: dict[str, list[str]] = {}
+                        if (
+                            not selected_rows_df.empty
+                            and "source_order_id" in selected_rows_df.columns
+                            and not df_orders.empty
+                            and "id" in df_orders.columns
+                            and "contract_id" in df_orders.columns
+                        ):
+                            m = selected_rows_df.copy()
+                            m["source_order_id"] = m["source_order_id"].astype(str)
+                            od = df_orders[["id", "contract_id", "start_date", "end_date", "spots", "seconds"]].copy()
+                            od["id"] = od["id"].astype(str)
+                            m = m.merge(od, left_on="source_order_id", right_on="id", how="left", suffixes=("", "_ord"))
+                            m["contract_id"] = m["contract_id"].astype(str).str.strip()
+                            m = m[m["contract_id"] != ""]
+                            for cid, g in m.groupby("contract_id"):
+                                notes_by_contract[str(cid)] = [
+                                    (
+                                        f"- seconds_type 更新為「{new_seconds_type}」；"
+                                        f"更新段數={len(g)}；"
+                                        f"範圍={str(g['start_date'].min())}~{str(g['end_date'].max())}"
+                                    )
+                                ]
+                        if notes_by_contract:
+                            from config_ragic import RAGIC_FIELDS
+                            from services_ragic_import import append_seconds_type_notes_to_ragic_by_contract_service
+
+                            ragic_url_candidates = [
+                                st.session_state.get("ragic_import_url", ""),
+                                st.session_state.get("ragic_test_url", ""),
+                            ]
+                            api_key_candidates = [
+                                st.session_state.get("ragic_import_api_key", ""),
+                                st.session_state.get("ragic_test_api_key", ""),
+                            ]
+                            ragic_url_use = next((str(x).strip() for x in ragic_url_candidates if str(x).strip()), "")
+                            api_key_use = next((str(x).strip() for x in api_key_candidates if str(x).strip()), "")
+                            touched, ragic_msgs = append_seconds_type_notes_to_ragic_by_contract_service(
+                                ragic_url=ragic_url_use,
+                                api_key=api_key_use,
+                                ragic_fields=RAGIC_FIELDS,
+                                notes_by_contract=notes_by_contract,
+                            )
+                            if touched > 0:
+                                st.caption(f"✅ 已附加回寫 Ragic 秒數管理備註：{touched} 筆")
+                            elif ragic_msgs:
+                                st.caption("ℹ️ Ragic 備註回寫提示：" + "；".join(ragic_msgs[:2]))
+                    except Exception as e:
+                        st.caption(f"ℹ️ Ragic 秒數管理備註回寫略過：{e}")
+
                     if auto_sync:
                         # 先做「逐列精準同步」；若失敗再 fallback 全表同步，提升正確性與可追蹤性。
                         sync_msgs = []
