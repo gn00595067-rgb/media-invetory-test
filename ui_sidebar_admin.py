@@ -23,39 +23,51 @@ def render_sidebar_admin(
     sync_sheets_if_enabled: Callable[..., object],
 ) -> None:
     st.sidebar.markdown("---")
-    if st.sidebar.button("🧨 重置資料庫（刪除並重建）", help="⚠️ 警告：這會刪除所有現有資料"):
+    if st.sidebar.button("🧨 重置資料庫（清空資料，保留 Users）", help="⚠️ 警告：會清空主要業務資料，保留帳號權限"):
         try:
+            # 改為直接清空資料表，避免依賴 db 檔路徑導致「看似重置、實際未清空」。
+            init_db()
             conn = get_db_connection()
-            conn.close()
-            if os.path.exists(db_file):
-                os.remove(db_file)
-                st.sidebar.success("✅ 已刪除資料庫，將重新初始化")
-                # 先重建空資料庫，確保同步時讀到的是「空表」而不是舊檔
-                init_db()
-                # 同步到 Google Sheet，讓「清空 DB」也能清空試算表內容
-                try:
-                    from sheets_backend import is_sheets_enabled
+            try:
+                c = conn.cursor()
+                c.execute("DELETE FROM orders")
+                c.execute("DELETE FROM ad_flight_segments")
+                c.execute("DELETE FROM platform_settings")
+                c.execute("DELETE FROM platform_monthly_capacity")
+                c.execute("DELETE FROM platform_monthly_purchase")
+                c.execute("DELETE FROM ragic_import_logs")
+                # 保留 users（帳號權限不動）
+                conn.commit()
+            finally:
+                conn.close()
 
-                    if not is_sheets_enabled():
-                        st.sidebar.warning("Google Sheet 未啟用或未設定：跳過同步。")
-                        st.session_state["_sheets_restored"] = True
-                        time.sleep(1)
-                        st.rerun()
-                except Exception:
-                    # is_sheets_enabled 失敗但同步可能仍可用，仍繼續嘗試同步
-                    pass
+            st.sidebar.success("✅ 已清空資料庫資料（Users 保留）")
 
-                errs = sync_sheets_if_enabled(skip_if_unchanged=False)
-                if errs:
-                    st.sidebar.error("Google Sheet 同步失敗：" + "; ".join(errs[:5]))
-                else:
-                    st.sidebar.success("✅ Google Sheet 也已同步（空表覆蓋）")
-                # 避免 app 重新啟動時又立刻從 Sheet 把資料灌回 DB
-                st.session_state["_sheets_restored"] = True
-                time.sleep(1)
-                st.rerun()
+            # 同步到 Google Sheet：只清空非 Users 工作表
+            try:
+                from sheets_backend import is_sheets_enabled
+
+                if not is_sheets_enabled():
+                    st.sidebar.warning("Google Sheet 未啟用或未設定：跳過同步。")
+                    st.session_state["_sheets_restored"] = True
+                    time.sleep(1)
+                    st.rerun()
+            except Exception:
+                # is_sheets_enabled 失敗但同步可能仍可用，仍繼續嘗試同步
+                pass
+
+            errs = sync_sheets_if_enabled(
+                only_tables=["Orders", "Segments", "PlatformSettings", "Capacity", "Purchase"],
+                skip_if_unchanged=False,
+            )
+            if errs:
+                st.sidebar.error("Google Sheet 同步失敗：" + "; ".join(errs[:5]))
             else:
-                st.sidebar.info("資料庫檔案不存在，無需刪除")
+                st.sidebar.success("✅ Google Sheet 已清空（Users 保留）")
+            # 避免 app 重新啟動時又立刻從 Sheet 把資料灌回 DB
+            st.session_state["_sheets_restored"] = True
+            time.sleep(1)
+            st.rerun()
         except Exception as e:
             st.sidebar.error(f"❌ 刪除失敗: {e}")
 
