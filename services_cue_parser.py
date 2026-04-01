@@ -357,13 +357,13 @@ def _find_ch_schedule_data_start_row(
             for c in range(date_start_col, min(len(row), date_start_col + n_date_cols))
         )
         if spot_sum > 0:
-            msg = f"資料起始列：第 {r + 1} 列（略過：{'; '.join(skipped) if skipped else '無'}）。"
+            msg = f"資料起始列：第 {r + 1} 列（略過：{'; '.join(str(x) for x in skipped) if skipped else '無'}）。"
             if diagnostics is not None:
                 diagnostics.append(msg)
             return r
         r += 1
     fallback = numeric_day_row + 2
-    msg = f"資料起始列：未在緊鄰列找到檔次數字，回退為第 {fallback + 1} 列（numeric_row+2）。略過：{'; '.join(skipped) if skipped else '無'}。"
+    msg = f"資料起始列：未在緊鄰列找到檔次數字，回退為第 {fallback + 1} 列（numeric_row+2）。略過：{'; '.join(str(x) for x in skipped) if skipped else '無'}。"
     if diagnostics is not None:
         diagnostics.append(msg)
     return min(fallback, len(df) - 1) if len(df) > 0 else 0
@@ -680,7 +680,7 @@ def analyze_cue_sheet_structure(df: pd.DataFrame, sheet_name: str) -> dict:
 def format_structure_report_zh(st: dict) -> str:
     lines = [
         f"══ 結構化判讀「{st.get('sheet_name', '')}」══",
-        f"（1）版型：{st.get('vendor') or 'unknown'}　" + "；".join(st.get("vendor_notes") or []),
+        f"（1）版型：{st.get('vendor') or 'unknown'}　" + "；".join(str(x) for x in (st.get("vendor_notes") or [])),
         f"（2）表形：{st['shape'][0]} 列 × {st['shape'][1]} 欄",
     ]
     tr = st.get("title_row_pair") or (None, None)
@@ -690,7 +690,7 @@ def format_structure_report_zh(st: dict) -> str:
         )
     labs = st.get("column_labels") or {}
     if labs:
-        parts = [f"[{j}]「{t[:36]}{'…' if len(str(t)) > 36 else ''}」" for j, t in sorted(labs.items()) if t]
+        parts = [f"[{j}]「{str(t)[:36]}{'…' if len(str(t)) > 36 else ''}」" for j, t in sorted(labs.items()) if t]
         lines.append("（3b）各欄標題：" + " ".join(parts[:24]))
         if len(parts) > 24:
             lines.append(f"　…其餘 {len(parts) - 24} 欄略")
@@ -714,7 +714,7 @@ def format_structure_report_zh(st: dict) -> str:
         f"建議第一筆資料列（0-based）={st.get('primary_data_row')}"
     )
     if st.get("blockers"):
-        lines.append("（8）卡住／待確認：" + " | ".join(st["blockers"]))
+        lines.append("（8）卡住／待確認：" + " | ".join(str(x) for x in st["blockers"]))
     lines.append("（9）【模擬表陣列節錄】")
     lines.append(st.get("matrix_preview") or "")
     return "\n".join(lines)
@@ -1369,7 +1369,9 @@ def quick_scan_cue_workbook(file_content: bytes, max_rows_per_sheet: int = 45) -
 
     names = list(xls.sheet_names)
     if len(names) > 1:
-        issues.append(f"此檔含 {len(names)} 個工作表：{', '.join(names[:8])}{'…' if len(names) > 8 else ''}；解析時會逐表嘗試。")
+        issues.append(
+            f"此檔含 {len(names)} 個工作表：{', '.join(str(x) for x in names[:8])}{'…' if len(names) > 8 else ''}；解析時會逐表嘗試。"
+        )
 
     for name in names:
         try:
@@ -1496,7 +1498,7 @@ def _classify_one_body_row(
     if time_hint:
         reasons.append("含時段格式")
     reasons.append(f"日期欄有 {spots} 天檔次>0")
-    return "data_candidate", (first or last_channel), "；".join(reasons)
+    return "data_candidate", (first or last_channel), "；".join(str(x) for x in reasons)
 
 
 def analyze_cue_schedule_body_rows(
@@ -1971,7 +1973,7 @@ def _extract_platform_from_sheet(df, sheet_name):
     }
     region_keywords = ["全省", "北北基", "中彰投", "桃竹苗", "高高屏", "雲嘉南", "宜花東"]
     for idx in range(min(30, len(df))):
-        row_text = " ".join(df.iloc[idx].astype(str).tolist())
+        row_text = " ".join(str(x) for x in df.iloc[idx].tolist())
         row_text_upper = row_text.upper()
         platform_found = None
         for platform in ["全家廣播", "全家新鮮視", "家樂福", "診所"]:
@@ -1991,7 +1993,7 @@ def _extract_platform_from_sheet(df, sheet_name):
 
 def _extract_seconds_from_sheet(df, sheet_name):
     for idx in range(min(20, len(df))):
-        row_text = " ".join(df.iloc[idx].astype(str).tolist())
+        row_text = " ".join(str(x) for x in df.iloc[idx].tolist())
         patterns = [r"(\d+)\s*秒", r"(\d+)\s*\"", r"廣告秒數[：:]\s*(\d+)", r"秒數[：:]\s*(\d+)"]
         for pattern in patterns:
             m = re.search(pattern, row_text)
