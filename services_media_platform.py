@@ -15,7 +15,13 @@ def parse_platform_region(raw_platform):
     if "新鮮視" in raw_platform:
         platform = "全家"
         channel = "新鮮視"
-    elif "企頻" in raw_platform or ("廣播" in raw_platform and "全家" in raw_platform):
+    # 業務用語：南頻／北頻＝企頻區域別，與「企頻」同等視為全家廣播(企頻)
+    elif (
+        "企頻" in raw_platform
+        or "南頻" in raw_platform
+        or "北頻" in raw_platform
+        or ("廣播" in raw_platform and "全家" in raw_platform)
+    ):
         platform = "全家"
         channel = "企頻"
     elif "家樂福" in raw_platform:
