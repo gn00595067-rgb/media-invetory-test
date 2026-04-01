@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 import time
 from typing import Callable
 
@@ -45,23 +44,30 @@ def render_sidebar_admin(
 
             # 同步到 Google Sheet：只清空非 Users 工作表
             try:
-                from sheets_backend import is_sheets_enabled
+                from sheets_backend import is_sheets_enabled, clear_business_tables_in_sheets
 
                 if not is_sheets_enabled():
                     st.sidebar.warning("Google Sheet 未啟用或未設定：跳過同步。")
                     st.session_state["_sheets_restored"] = True
                     time.sleep(1)
                     st.rerun()
+                # 優先直接清空 Sheet（不依賴 DB 同步），確保畫面可立即清空
+                direct_clear_errs = clear_business_tables_in_sheets(keep_users=True)
+                if direct_clear_errs:
+                    st.sidebar.error("Google Sheet 直接清空失敗：" + "; ".join(direct_clear_errs[:5]))
+                    return
             except Exception:
                 # is_sheets_enabled 失敗但同步可能仍可用，仍繼續嘗試同步
                 pass
 
+            # 後備：再做一次 DB->Sheet 同步，避免欄位差異造成不一致
             errs = sync_sheets_if_enabled(
                 only_tables=["Orders", "Segments", "PlatformSettings", "Capacity", "Purchase"],
                 skip_if_unchanged=False,
             )
             if errs:
                 st.sidebar.error("Google Sheet 同步失敗：" + "; ".join(errs[:5]))
+                return
             else:
                 st.sidebar.success("✅ Google Sheet 已清空（Users 保留）")
             # 避免 app 重新啟動時又立刻從 Sheet 把資料灌回 DB

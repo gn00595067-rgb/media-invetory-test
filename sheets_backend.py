@@ -738,6 +738,84 @@ def sync_db_to_sheets(
     return errors
 
 
+def clear_business_tables_in_sheets(*, keep_users: bool = True) -> list[str]:
+    """
+    直接清空 Google Sheet 的業務資料分頁（不依賴 DB 內容）。
+    預設保留 Users 分頁不動。
+    """
+    errors: list[str] = []
+    table_jobs: list[tuple[str, list[str], Any]] = [
+        (
+            WS_ORDERS,
+            [
+                "id",
+                "platform",
+                "client",
+                "product",
+                "sales",
+                "company",
+                "start_date",
+                "end_date",
+                "seconds",
+                "spots",
+                "amount_net",
+                "updated_at",
+                "contract_id",
+                "seconds_type",
+                "project_amount_net",
+                "split_amount",
+                "region",
+            ],
+            write_orders_to_sheets,
+        ),
+        (
+            WS_SEGMENTS,
+            [
+                "segment_id",
+                "source_order_id",
+                "platform",
+                "channel",
+                "region",
+                "media_platform",
+                "company",
+                "sales",
+                "client",
+                "product",
+                "seconds",
+                "spots",
+                "start_date",
+                "end_date",
+                "duration_days",
+                "store_count",
+                "total_spots",
+                "total_store_seconds",
+                "seconds_type",
+                "created_at",
+                "updated_at",
+            ],
+            write_segments_to_sheets,
+        ),
+        (WS_PLATFORM_SETTINGS, ["platform", "store_count", "daily_hours"], write_platform_settings_to_sheets),
+        (WS_CAPACITY, ["media_platform", "year", "month", "daily_available_seconds"], write_capacity_to_sheets),
+        (WS_PURCHASE, ["media_platform", "year", "month", "purchased_seconds", "purchase_price"], write_purchase_to_sheets),
+    ]
+    if not keep_users:
+        table_jobs.append((WS_USERS, ["id", "username", "password_hash", "role", "created_at"], write_users_to_sheets))
+
+    for name, cols, writer in table_jobs:
+        try:
+            err = writer(pd.DataFrame(columns=cols))
+            if err:
+                errors.append(f"{name}: {err}")
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+
+    reason = get_last_client_error()
+    if errors and reason:
+        errors.insert(0, reason)
+    return errors
+
+
 def load_all_from_sheets_into_db(get_db_connection, init_db) -> list[str]:
     """
     從 Google Sheet 讀取所有表並寫入 SQLite（覆蓋本地）。
